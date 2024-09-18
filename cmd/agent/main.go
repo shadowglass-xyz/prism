@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -19,7 +20,9 @@ const (
 )
 
 func main() {
-	slog.Info("starting", "version", version)
+	slog.Info("AGENT: starting", "version", version)
+
+	controlPlaneURL := os.Getenv("CONTROL_PLANE_URL")
 
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
@@ -32,22 +35,59 @@ func main() {
 
 	go func() {
 		select {
-		case <-signalChan: // first signal, cancel context
+		case <-signalChan:
+			slog.Info("received first kill signal, cancel context")
 			cancel()
 		case <-ctx.Done():
 		}
-		<-signalChan // second signal, hard exit
+		slog.Info("received second kill signal, hard exit")
+		<-signalChan
 		os.Exit(exitCodeInterrupt)
 	}()
 
-	if err := run(ctx); err != nil {
+	if err := run(ctx, controlPlaneURL); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(exitCodeErr)
 	}
 }
 
-func run(ctx context.Context) error {
+func run(ctx context.Context, controlPlaneURL string) error {
 	wg, ctx := errgroup.WithContext(ctx)
+
+	con, err := nats.Connect(controlPlaneURL)
+	if err != nil {
+		return fmt.Errorf("connecting to control plane: %w", err)
+	}
+	defer con.Close()
+
+	wg.Go(func() error {
+		slog.Info("AGENT: connected to control plane", "url", controlPlaneURL)
+
+		for {
+			slog.Info("AGENT: published to agent.ping")
+			err := con.Publish("agent.ping", []byte("ping"))
+			if err != nil {
+				return fmt.Errorf("publishing to agent.ping: %w", err)
+			}
+
+			select {
+			case <-time.After(10 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+
+	wg.Go(func() error {
+		_, err := con.Subscribe("container.create", func(msg *nats.Msg) {
+			slog.Info("AGENT: creating container", "container", string(msg.Data))
+		})
+		if err != nil {
+			return fmt.Errorf("subscribing to container.create: %w", err)
+		}
+
+		return nil
+	})
 
 	wg.Go(func() error {
 		for {
@@ -55,7 +95,7 @@ func run(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-time.After(1 * time.Minute):
-				slog.Info("Application is still running")
+				slog.Info("AGENT: running")
 			}
 		}
 	})
