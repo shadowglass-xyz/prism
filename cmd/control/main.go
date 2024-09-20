@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"shadowglass/internal/model"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
@@ -103,13 +105,22 @@ func run(ctx context.Context, ns *server.Server) error {
 
 	wg.Go(func() error {
 		for {
-			err := con.Publish("container.create", []byte("hello-world"))
+			b, err := json.Marshal(model.Container{
+				Name:  "my-hello-world",
+				Image: "hello-world:latest",
+				Count: 1,
+			})
+			if err != nil {
+				panic(err)
+			}
+
+			err = con.Publish("container.create", b)
 			if err != nil {
 				return fmt.Errorf("publish to container.create: %w", err)
 			}
 
 			select {
-			case <-time.After(1 * time.Minute):
+			case <-time.After(10 * time.Second):
 			case <-ctx.Done():
 				return ctx.Err()
 			}
