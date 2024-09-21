@@ -1,4 +1,5 @@
 build
+db
 .vagrant
 .idea
 go.work

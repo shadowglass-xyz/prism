@@ -2,47 +2,49 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
-	"shadowglass/internal/model"
+	"shadowglass"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
-	"golang.org/x/sync/errgroup"
+	"github.com/pressly/goose/v3"
+	_ "modernc.org/sqlite"
 )
 
 const (
 	exitCodeErr       = 1
 	exitCodeInterrupt = 2
+	userID            = "iug6920l2cbz7mf6sg60sb29wxhqaz0o"
 )
 
-func main() {
-	slog.Info("CP: starting control")
+var pragmas = `
+PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA foreign_keys = ON;
+`
 
-	opts := &server.Options{}
-	ns, err := server.NewServer(opts)
+func main() {
+	db, err := setupDB()
 	if err != nil {
 		panic(err)
 	}
+	defer db.Close()
 
-	go ns.Start()
-
-	ns.ConfigureLogger()
-
-	// Reset any signals that were set by nats server Start
-	signal.Reset()
-
-	if !ns.ReadyForConnections(4 * time.Second) {
-		panic("not ready for connection")
+	natsServer, err := setupNATSServer()
+	if err != nil {
+		panic(err)
 	}
+	defer natsServer.Shutdown()
 
 	slog.Info("CP: NATS server is ready to accept connections")
 
+	// Configure context for shutdown handling
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	signalChan := make(chan os.Signal, 1)
@@ -56,7 +58,7 @@ func main() {
 		select {
 		case <-signalChan: // first signal, cancel context
 			slog.Info("CP: received cancellation. shutting down nats server")
-			ns.Shutdown()
+			natsServer.Shutdown()
 			cancel()
 		case <-ctx.Done():
 		}
@@ -64,84 +66,79 @@ func main() {
 		os.Exit(exitCodeInterrupt)
 	}()
 
-	if err := run(ctx, ns); err != nil {
+	conn, err := nats.Connect(natsServer.ClientURL(), nats.InProcessServer(natsServer))
+	if err != nil {
+		panic(fmt.Sprintf("connecting to inprocess NATS server: %s", err))
+	}
+	defer conn.Close()
+
+	c := control{
+		db:         db,
+		natsServer: natsServer,
+		natsConn:   conn,
+	}
+
+	if err := c.run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
+		if errors.Is(err, context.Canceled) {
+			os.Exit(0)
+		}
+
 		os.Exit(exitCodeErr)
 	}
 }
 
-func run(ctx context.Context, ns *server.Server) error {
-	wg, ctx := errgroup.WithContext(ctx)
-
-	con, err := nats.Connect(ns.ClientURL(), nats.InProcessServer(ns))
+func setupDB() (*sql.DB, error) {
+	err := os.MkdirAll("db", os.ModePerm)
 	if err != nil {
-		return fmt.Errorf("connecting to inprocess NATS server: %w", err)
-	}
-	defer con.Close()
-
-	wg.Go(func() error {
-		http.Handle("/updates/", http.StripPrefix("/updates/", http.FileServer(http.Dir("public"))))
-		if err := http.ListenAndServe(":8080", nil); err != nil {
-			return fmt.Errorf("http listen and serve: %w", err)
-		}
-
-		return nil
-	})
-
-	wg.Go(func() error {
-		_, err = con.Subscribe("agent.ping", func(msg *nats.Msg) {
-			slog.Info("CP: received nats message", "msg", string(msg.Data))
-			// err := msg.Respond([]byte("pong"))
-			// if err != nil {
-			// 	slog.Info("CP: received error when trying to respond to ping", "err", err)
-			// }
-		})
-		if err != nil {
-			return fmt.Errorf("subscribing to agent.ping: %w", err)
-		}
-
-		return nil
-	})
-
-	wg.Go(func() error {
-		for {
-			b, err := json.Marshal(model.Container{
-				Name:  "my-hello-world",
-				Image: "hello-world:latest",
-				Count: 1,
-			})
-			if err != nil {
-				panic(err)
-			}
-
-			err = con.Publish("container.create", b)
-			if err != nil {
-				return fmt.Errorf("publish to container.create: %w", err)
-			}
-
-			select {
-			case <-time.After(10 * time.Second):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	})
-
-	wg.Go(func() error {
-		for {
-			slog.Info("CP: running")
-
-			select {
-			case <-time.After(time.Minute):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	})
-
-	if err := wg.Wait(); err != nil {
-		return fmt.Errorf("error group wait: %w", err)
+		return nil, fmt.Errorf("creating db directory for database: %w", err)
 	}
 
-	return nil
+	// setup database
+	db, err := sql.Open("sqlite", "db/control.db")
+	if err != nil {
+		return nil, fmt.Errorf("opening connection to control database: %w", err)
+	}
+
+	_, err = db.Exec(pragmas)
+	if err != nil {
+		return nil, fmt.Errorf("setting pragmas on database connection: %w", err)
+	}
+
+	goose.SetBaseFS(shadowglass.MigrationsFS)
+
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		return nil, fmt.Errorf("configuring goose migrator for sqlite3 dialect: %w", err)
+	}
+
+	if err := goose.Up(db, "migrations"); err != nil {
+		return nil, fmt.Errorf("running goose migrations: %w", err)
+	}
+
+	return db, nil
+}
+
+func setupNATSServer() (*natsserver.Server, error) {
+	opts := &natsserver.Options{
+		Debug: true,
+		Trace: true,
+	}
+	ns, err := natsserver.NewServer(opts)
+	if err != nil {
+		return nil, fmt.Errorf("setting up nats server: %w", err)
+	}
+
+	go ns.Start()
+
+	ns.ConfigureLogger()
+
+	maxWait := 4 * time.Second
+	if !ns.ReadyForConnections(4 * time.Second) {
+		return nil, fmt.Errorf("nats server wasn't able to accept connections after %s", maxWait)
+	}
+
+	// Reset any signals that were set by nats server Start
+	signal.Reset()
+
+	return ns, nil
 }

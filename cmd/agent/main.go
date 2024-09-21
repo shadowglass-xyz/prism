@@ -130,7 +130,7 @@ func dockerReconcileLoop(ctx context.Context) error {
 			return fmt.Errorf("connecting to docker: %w", err)
 		}
 
-		containers, err := cli.ContainerList(ctx, container.ListOptions{})
+		containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 		if err != nil {
 			panic(err)
 		}
@@ -143,9 +143,18 @@ func dockerReconcileLoop(ctx context.Context) error {
 		for name, c := range state {
 			foundContainer := false
 			for _, rc := range containers {
-				if slices.Contains(rc.Names, name) {
+				if slices.Contains(rc.Names, "/"+name) {
 					foundContainer = true
 					slog.Info("need to update a container")
+					err := cli.ContainerStop(ctx, rc.ID, container.StopOptions{})
+					if err != nil {
+						slog.Warn("error stopping container", "container", rc, "err", err)
+					}
+
+					err = cli.ContainerRemove(ctx, rc.ID, container.RemoveOptions{})
+					if err != nil {
+						slog.Warn("error removing container", "container", rc, "err", err)
+					}
 				}
 			}
 
@@ -158,9 +167,10 @@ func dockerReconcileLoop(ctx context.Context) error {
 
 				slog.Info("need to create a new container")
 				// Container is completely missing so we have to create it
-				_, err = cli.ContainerCreate(ctx,
+				resp, err := cli.ContainerCreate(ctx,
 					&container.Config{
 						Image: c.Image,
+						Cmd:   c.Cmd,
 					},
 					&container.HostConfig{},
 					&network.NetworkingConfig{},
@@ -169,6 +179,11 @@ func dockerReconcileLoop(ctx context.Context) error {
 				)
 				if err != nil {
 					slog.Info("unable to create container", "err", err)
+				}
+
+				err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{})
+				if err != nil {
+					slog.Info("unable to start container", "err", err)
 				}
 			}
 		}
