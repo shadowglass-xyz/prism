@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/signal"
 	"shadowglass/internal/model"
+	"shadowglass/internal/state"
 	"slices"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
@@ -63,11 +65,19 @@ func main() {
 func run(ctx context.Context, controlPlaneURL string) error {
 	wg, ctx := errgroup.WithContext(ctx)
 
+	hostname, err := os.Hostname()
+	if err != nil {
+		return err
+	}
+
 	con, err := nats.Connect(controlPlaneURL)
 	if err != nil {
 		return fmt.Errorf("connecting to control plane: %w", err)
 	}
 	defer con.Close()
+
+	// TODO: retrieve the current state store from NATs. Probably by phoning the control plane and registering
+	st := state.New()
 
 	wg.Go(func() error {
 		slog.Info("AGENT: connected to control plane", "url", controlPlaneURL)
@@ -96,7 +106,7 @@ func run(ctx context.Context, controlPlaneURL string) error {
 			}
 
 			slog.Info("AGENT: creating container", "container", container)
-			addContainerToState(container.Name, container)
+			st.AddContainer(container)
 		})
 		if err != nil {
 			return fmt.Errorf("subscribing to container.create: %w", err)
@@ -117,76 +127,145 @@ func run(ctx context.Context, controlPlaneURL string) error {
 	})
 
 	wg.Go(func() error {
-		return dockerReconcileLoop(ctx)
+		return dockerReconcileLoop(ctx, hostname, &st)
 	})
 
 	return wg.Wait()
 }
 
-func dockerReconcileLoop(ctx context.Context) error {
+func dockerReconcileLoop(ctx context.Context, hostname string, st *state.State) error {
 	for {
-		cli, err := client.NewClientWithOpts(client.WithVersion("1.47"))
+		cli, err := client.NewClientWithOpts(client.WithVersion("1.46"))
 		if err != nil {
 			return fmt.Errorf("connecting to docker: %w", err)
 		}
 
-		containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+		containers, err := cli.ContainerList(ctx, container.ListOptions{
+			All:     true,
+			Filters: filters.NewArgs(filters.KeyValuePair{Key: "label", Value: "controlled-by=prism"}),
+		})
 		if err != nil {
 			panic(err)
 		}
 
-		slog.Info("Received docker containers", "containers", containers)
+		existingContainerNames := make([]string, 0, len(containers))
+		for _, c := range containers {
+			existingContainerNames = append(existingContainerNames, c.Names...)
+		}
 
-		state := getState()
-		slog.Info("current state", "state", state)
+		slog.Info("Existing container names", "names", existingContainerNames)
 
-		for name, c := range state {
-			foundContainer := false
-			for _, rc := range containers {
-				if slices.Contains(rc.Names, "/"+name) {
-					foundContainer = true
-					slog.Info("need to update a container")
-					err := cli.ContainerStop(ctx, rc.ID, container.StopOptions{})
-					if err != nil {
-						slog.Warn("error stopping container", "container", rc, "err", err)
-					}
+		// Loop over requested state to find containers that shouldn't exist
 
-					err = cli.ContainerRemove(ctx, rc.ID, container.RemoveOptions{})
-					if err != nil {
-						slog.Warn("error removing container", "container", rc, "err", err)
-					}
-				}
-			}
-
-			if !foundContainer {
-				b, err := cli.ImagePull(ctx, c.Image, image.PullOptions{})
-				if err != nil {
-					panic(err)
-				}
-				defer b.Close()
-
-				slog.Info("need to create a new container")
-				// Container is completely missing so we have to create it
-				resp, err := cli.ContainerCreate(ctx,
-					&container.Config{
-						Image: c.Image,
-						Cmd:   c.Cmd,
-					},
-					&container.HostConfig{},
-					&network.NetworkingConfig{},
-					&v1.Platform{},
-					name,
-				)
-				if err != nil {
-					slog.Info("unable to create container", "err", err)
-				}
-
-				err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{})
-				if err != nil {
-					slog.Info("unable to start container", "err", err)
-				}
+		var missingContainers []string
+		var existingContainers []string
+		for _, name := range st.Names() {
+			if !slices.Contains(existingContainerNames, "/"+name) {
+				missingContainers = append(missingContainers, name)
+			} else {
+				existingContainers = append(existingContainers, name)
 			}
 		}
+
+		slog.Info("Missing containers", "names", missingContainers)
+		slog.Info("Existing containers", "names", existingContainers)
+
+		// Loop over existing state to find missing containers
+
+		var extraContainers []string
+		for _, name := range existingContainerNames {
+			if !slices.Contains(st.Names(), "/"+name) {
+				extraContainers = append(extraContainers, name)
+			}
+		}
+
+		slog.Info("Extra containers", "names", extraContainers)
+
+		for _, name := range missingContainers {
+			c, ok := st.Get(name)
+			if !ok {
+				slog.Info("unable to find container %s in state")
+			}
+
+			b, err := cli.ImagePull(ctx, c.Image, image.PullOptions{})
+			if err != nil {
+				panic(err)
+			}
+			defer b.Close()
+
+			slog.Info("need to create a new container")
+			// Container is completely missing so we have to create it
+			resp, err := cli.ContainerCreate(ctx,
+				&container.Config{
+					Image: c.Image,
+					Cmd:   c.Cmd,
+					Labels: map[string]string{
+						"controlled-by": "prism",
+						"assigned-host": hostname,
+					},
+				},
+				&container.HostConfig{},
+				&network.NetworkingConfig{},
+				&v1.Platform{},
+				name,
+			)
+			if err != nil {
+				slog.Info("unable to create container", "err", err)
+			}
+
+			err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{})
+			if err != nil {
+				slog.Info("unable to start container", "err", err)
+			}
+		}
+
+		// for name, c := range state {
+		// 	foundContainer := false
+		// 	for _, rc := range containers {
+		// 		if slices.Contains(rc.Names, "/"+name) {
+		// 			foundContainer = true
+		// 			slog.Info("need to update a container")
+		// 			err := cli.ContainerStop(ctx, rc.ID, container.StopOptions{})
+		// 			if err != nil {
+		// 				slog.Warn("error stopping container", "container", rc, "err", err)
+		// 			}
+		//
+		// 			err = cli.ContainerRemove(ctx, rc.ID, container.RemoveOptions{})
+		// 			if err != nil {
+		// 				slog.Warn("error removing container", "container", rc, "err", err)
+		// 			}
+		// 		}
+		// 	}
+		//
+		// 	if !foundContainer {
+		// 		b, err := cli.ImagePull(ctx, c.Image, image.PullOptions{})
+		// 		if err != nil {
+		// 			panic(err)
+		// 		}
+		// 		defer b.Close()
+		//
+		// 		slog.Info("need to create a new container")
+		// 		// Container is completely missing so we have to create it
+		// 		resp, err := cli.ContainerCreate(ctx,
+		// 			&container.Config{
+		// 				Image: c.Image,
+		// 				Cmd:   c.Cmd,
+		// 			},
+		// 			&container.HostConfig{},
+		// 			&network.NetworkingConfig{},
+		// 			&v1.Platform{},
+		// 			name,
+		// 		)
+		// 		if err != nil {
+		// 			slog.Info("unable to create container", "err", err)
+		// 		}
+		//
+		// 		err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{})
+		// 		if err != nil {
+		// 			slog.Info("unable to start container", "err", err)
+		// 		}
+		// 	}
+		// }
 
 		select {
 		case <-time.After(10 * time.Second):

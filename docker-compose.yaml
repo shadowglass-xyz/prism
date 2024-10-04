@@ -1,0 +1,17 @@
+services:
+  agent-1: &agent
+    image: alpine:latest
+    volumes:
+      - ./build/agent:/usr/local/bin/shadowglass-agent
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - agent
+    environment:
+      CONTROL_PLANE_URL: http://host.docker.internal:4222
+    command:
+      - /usr/local/bin/shadowglass-agent
+
+  agent-2: *agent
+
+networks:
+  agent:

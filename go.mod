@@ -1,6 +1,6 @@
 module shadowglass
 
-go 1.22.2
+go 1.23
 
 require (
 	github.com/sanbornm/go-selfupdate v0.0.0-20230714125711-e1c03e3d6ac7
