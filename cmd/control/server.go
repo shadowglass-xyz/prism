@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -30,6 +31,10 @@ func (c *control) run(ctx context.Context) error {
 	})
 
 	wg.Go(func() error {
+		return c.handleNodeRegistration()
+	})
+
+	wg.Go(func() error {
 		return c.handleHeartbeat(ctx)
 	})
 
@@ -50,6 +55,28 @@ func (c *control) handlePing() error {
 	})
 	if err != nil {
 		return fmt.Errorf("subscribing to agent.ping: %w", err)
+	}
+
+	return nil
+}
+
+func (c *control) handleNodeRegistration() error {
+	_, err := c.natsConn.Subscribe("agent.registration", func(msg *nats.Msg) {
+		slog.Info("CP: received agent registration", "msg", string(msg.Data))
+
+		var reg model.NodeRegistration
+		err := json.NewDecoder(bytes.NewReader(msg.Data)).Decode(&reg)
+		if err != nil {
+			panic(err)
+		}
+
+		gbFree := float64(reg.FreeMemory) / 1024 / 1024 / 1024
+		gbTotal := float64(reg.TotalMemory) / 1024 / 1024 / 1024
+
+		slog.Info("CP: Decoded agent registration", "reg", reg, "gbFree", gbFree, "gbTotal", gbTotal)
+	})
+	if err != nil {
+		return fmt.Errorf("subscribing to agent.registration: %w", err)
 	}
 
 	return nil

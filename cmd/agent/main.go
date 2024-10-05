@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"shadowglass/internal/model"
 	"shadowglass/internal/state"
 	"slices"
@@ -19,6 +21,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/nats-io/nats.go"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pbnjay/memory"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -78,6 +81,22 @@ func run(ctx context.Context, controlPlaneURL string) error {
 
 	// TODO: retrieve the current state store from NATs. Probably by phoning the control plane and registering
 	st := state.New()
+
+	stats, err := gatherSystemStats()
+	if err != nil {
+		return err
+	}
+
+	var statsB bytes.Buffer
+	err = json.NewEncoder(&statsB).Encode(stats)
+	if err != nil {
+		return err
+	}
+
+	err = con.Publish("agent.registration", statsB.Bytes())
+	if err != nil {
+		return fmt.Errorf("sending agent registration: %w", err)
+	}
 
 	wg.Go(func() error {
 		slog.Info("AGENT: connected to control plane", "url", controlPlaneURL)
@@ -273,4 +292,21 @@ func dockerReconcileLoop(ctx context.Context, hostname string, st *state.State) 
 			return ctx.Err()
 		}
 	}
+}
+
+func gatherSystemStats() (model.NodeRegistration, error) {
+	fm := memory.FreeMemory()
+	tm := memory.TotalMemory()
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		return model.NodeRegistration{}, err
+	}
+
+	return model.NodeRegistration{
+		Hostname:    hostname,
+		CPUs:        runtime.NumCPU(),
+		FreeMemory:  fm,
+		TotalMemory: tm,
+	}, nil
 }
