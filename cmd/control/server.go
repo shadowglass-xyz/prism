@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"shadowglass/internal/model"
+	"sync"
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
@@ -15,31 +16,39 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type control struct {
+type server struct {
 	db         *sql.DB
 	natsServer *natsserver.Server
 	natsConn   *nats.Conn
+	nodesMutex sync.Mutex
+	knownNodes []model.NodeRegistration
 }
 
-func (c *control) run(ctx context.Context) error {
+type goal struct {
+	Containers []model.Container
+}
+
+func (s *server) run(ctx context.Context) error {
 	slog.Info("CP: starting control")
+
+	g := getGoal()
 
 	wg, ctx := errgroup.WithContext(ctx)
 
 	wg.Go(func() error {
-		return c.handlePing()
+		return s.handlePing()
 	})
 
 	wg.Go(func() error {
-		return c.handleNodeRegistration()
+		return s.handleNodeRegistration()
 	})
 
 	wg.Go(func() error {
-		return c.handleHeartbeat(ctx)
+		return s.handleHeartbeat(ctx)
 	})
 
 	wg.Go(func() error {
-		return c.issueCreateContainerRequest(ctx)
+		return s.issueWorkToNodes(ctx, g)
 	})
 
 	if err := wg.Wait(); err != nil {
@@ -49,8 +58,8 @@ func (c *control) run(ctx context.Context) error {
 	return nil
 }
 
-func (c *control) handlePing() error {
-	_, err := c.natsConn.Subscribe("agent.ping", func(msg *nats.Msg) {
+func (s *server) handlePing() error {
+	_, err := s.natsConn.Subscribe("agent.ping", func(msg *nats.Msg) {
 		slog.Info("CP: received nats message", "msg", string(msg.Data))
 	})
 	if err != nil {
@@ -60,8 +69,8 @@ func (c *control) handlePing() error {
 	return nil
 }
 
-func (c *control) handleNodeRegistration() error {
-	_, err := c.natsConn.Subscribe("agent.registration", func(msg *nats.Msg) {
+func (s *server) handleNodeRegistration() error {
+	_, err := s.natsConn.Subscribe("agent.registration", func(msg *nats.Msg) {
 		slog.Info("CP: received agent registration", "msg", string(msg.Data))
 
 		var reg model.NodeRegistration
@@ -73,6 +82,12 @@ func (c *control) handleNodeRegistration() error {
 		gbFree := float64(reg.FreeMemory) / 1024 / 1024 / 1024
 		gbTotal := float64(reg.TotalMemory) / 1024 / 1024 / 1024
 
+		s.nodesMutex.Lock()
+		defer s.nodesMutex.Unlock()
+		s.knownNodes = append(s.knownNodes, reg)
+
+		slog.Info("CP: Known nodes", "knownNodes", s.knownNodes)
+
 		slog.Info("CP: Decoded agent registration", "reg", reg, "gbFree", gbFree, "gbTotal", gbTotal)
 	})
 	if err != nil {
@@ -82,7 +97,7 @@ func (c *control) handleNodeRegistration() error {
 	return nil
 }
 
-func (c *control) handleHeartbeat(ctx context.Context) error {
+func (s *server) handleHeartbeat(ctx context.Context) error {
 	for {
 		slog.Info("CP: running")
 
@@ -94,19 +109,14 @@ func (c *control) handleHeartbeat(ctx context.Context) error {
 	}
 }
 
-func (c *control) issueCreateContainerRequest(ctx context.Context) error {
+func (s *server) issueCreateContainerRequest(ctx context.Context, hostname string, container model.Container) error {
 	for {
-		b, err := json.Marshal(model.Container{
-			Name:  "my-alpine-hello-world",
-			Image: "alpine:latest",
-			Cmd:   []string{"echo", "Hello from Docker!"},
-			Count: 1,
-		})
+		b, err := json.Marshal(container)
 		if err != nil {
 			return fmt.Errorf("marshalling container: %w", err)
 		}
 
-		err = c.natsConn.Publish("container.create", b)
+		err = s.natsConn.Publish(fmt.Sprintf("agent.action.%s", hostname), b)
 		if err != nil {
 			return fmt.Errorf("publish to container.create: %w", err)
 		}
@@ -116,5 +126,50 @@ func (c *control) issueCreateContainerRequest(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+}
+
+func (s *server) issueWorkToNodes(ctx context.Context, goal goal) error {
+	if len(s.knownNodes) > 0 {
+		slog.Info("No known nodes. Will retry later")
+	}
+
+	for i, g := range goal.Containers {
+		ni := i % len(s.knownNodes)
+		node := s.knownNodes[ni]
+		err := s.issueCreateContainerRequest(ctx, node.Hostname, g)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func getGoal() goal {
+	return goal{
+		Containers: []model.Container{
+			{
+				Name:  "my-alpine-hello-world",
+				Image: "alpine:latest",
+				Env:   []string{"NAME=alpine"},
+				Cmd:   []string{"echo", "Hello from ${NAME}!", "&&", "sleep", "infinity"},
+				Count: 1,
+			},
+			{
+				Name:  "my-debian-hello-world",
+				Image: "debian:latest",
+				Env:   []string{"NAME=debian"},
+				Cmd:   []string{"echo", "Hello from ${NAME}!", "&&", "sleep", "infinity"},
+				Count: 1,
+			},
+			{
+				Name:  "my-ubuntu-hello-world",
+				Image: "ubuntu:latest",
+				Env:   []string{"NAME=ubuntu"},
+				Cmd:   []string{"echo", "Hello from ${NAME}!", "&&", "sleep", "infinity"},
+				Count: 1,
+			},
+		},
 	}
 }

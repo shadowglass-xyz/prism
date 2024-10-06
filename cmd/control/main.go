@@ -72,7 +72,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	c := control{
+	c := server{
 		db:         db,
 		natsServer: natsServer,
 		natsConn:   conn,

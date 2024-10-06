@@ -79,10 +79,15 @@ func run(ctx context.Context, controlPlaneURL string) error {
 	}
 	defer con.Close()
 
+	cli, err := client.NewClientWithOpts(client.WithVersion("1.46"))
+	if err != nil {
+		return fmt.Errorf("connecting to docker: %w", err)
+	}
+
 	// TODO: retrieve the current state store from NATs. Probably by phoning the control plane and registering
 	st := state.New()
 
-	stats, err := gatherSystemStats()
+	stats, err := gatherSystemStats(ctx, cli)
 	if err != nil {
 		return err
 	}
@@ -117,7 +122,7 @@ func run(ctx context.Context, controlPlaneURL string) error {
 	})
 
 	wg.Go(func() error {
-		_, err := con.Subscribe("container.create", func(msg *nats.Msg) {
+		_, err := con.Subscribe(fmt.Sprintf("agent.action.%s", hostname), func(msg *nats.Msg) {
 			var container model.Container
 			err := json.Unmarshal(msg.Data, &container)
 			if err != nil {
@@ -125,7 +130,10 @@ func run(ctx context.Context, controlPlaneURL string) error {
 			}
 
 			slog.Info("AGENT: creating container", "container", container)
-			st.AddContainer(container)
+			err = st.AddContainer(container)
+			if err != nil {
+				panic(err)
+			}
 		})
 		if err != nil {
 			return fmt.Errorf("subscribing to container.create: %w", err)
@@ -146,19 +154,14 @@ func run(ctx context.Context, controlPlaneURL string) error {
 	})
 
 	wg.Go(func() error {
-		return dockerReconcileLoop(ctx, hostname, &st)
+		return dockerReconcileLoop(ctx, cli, hostname, &st)
 	})
 
 	return wg.Wait()
 }
 
-func dockerReconcileLoop(ctx context.Context, hostname string, st *state.State) error {
+func dockerReconcileLoop(ctx context.Context, cli *client.Client, hostname string, st *state.State) error {
 	for {
-		cli, err := client.NewClientWithOpts(client.WithVersion("1.46"))
-		if err != nil {
-			return fmt.Errorf("connecting to docker: %w", err)
-		}
-
 		containers, err := cli.ContainerList(ctx, container.ListOptions{
 			All:     true,
 			Filters: filters.NewArgs(filters.KeyValuePair{Key: "label", Value: "controlled-by=prism"}),
@@ -294,13 +297,35 @@ func dockerReconcileLoop(ctx context.Context, hostname string, st *state.State) 
 	}
 }
 
-func gatherSystemStats() (model.NodeRegistration, error) {
+func gatherSystemStats(ctx context.Context, cli *client.Client) (model.NodeRegistration, error) {
 	fm := memory.FreeMemory()
 	tm := memory.TotalMemory()
 
 	hostname, err := os.Hostname()
 	if err != nil {
 		return model.NodeRegistration{}, err
+	}
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.KeyValuePair{Key: "label", Value: "controlled-by=prism"}),
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	var mc []model.Container
+	for _, c := range containers {
+		mc = append(mc, model.Container{
+			Names:       c.Names,
+			Image:       c.Image,
+			Count:       1,
+			Environment: c,
+			Labels:      c.Labels,
+			Command:     c.Command,
+			State:       c.State,
+			Status:      c.Status,
+		})
 	}
 
 	return model.NodeRegistration{
