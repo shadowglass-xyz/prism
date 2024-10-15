@@ -18,17 +18,19 @@ type NodeCommand struct {
 
 // Container represents a request to create a container
 type Container struct {
+	ID         string            `json:"id"`
 	Name       string            `json:"name"`
 	Image      string            `json:"image"`
-	Count      int               `json:"count"`
 	Env        []string          `json:"env"`
 	Labels     map[string]string `json:"labels"`
 	Entrypoint string            `json:"entrypoint"`
 	Cmd        []string          `json:"cmd"`
+	Status     string            `json:"status"`
 }
 
-// NodeRegistration is used to send initial statistics about a system upon agent boot
-type NodeRegistration struct {
+// NodeUpdate is used to send statistics about a system
+type NodeUpdate struct {
+	ID          string      `json:"id"`
 	Hostname    string      `json:"hostname"`
 	CPUs        int         `json:"cpus"`
 	FreeMemory  uint64      `json:"freeMemory"`
