@@ -4,7 +4,7 @@ dev:
 control:
     go run shadowglass/cmd/control
 
-agent:
+agents:
     GOOS=linux GOARCH=arm64 go build -o build/agent shadowglass/cmd/agent
     docker compose up
 

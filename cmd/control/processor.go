@@ -10,12 +10,14 @@ import (
 	"shadowglass/internal/model"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
 
 type goal struct {
-	Containers []model.Container
+	goalMutex  sync.Mutex
+	Containers map[string]model.Container
 }
 
 // Processor provides dependencies necessary to process incoming messages
@@ -23,7 +25,7 @@ type Processor struct {
 	natsConnection *nats.Conn
 	msgs           <-chan interface{}
 	nodesMutex     sync.Mutex
-	nodes          map[string]model.NodeUpdate
+	nodes          map[string]model.AgentUpdate
 	goal           goal
 }
 
@@ -31,7 +33,7 @@ func newProcessor(conn *nats.Conn, msgs <-chan interface{}) *Processor {
 	return &Processor{
 		natsConnection: conn,
 		msgs:           msgs,
-		nodes:          make(map[string]model.NodeUpdate),
+		nodes:          make(map[string]model.AgentUpdate),
 		goal:           getGoal(),
 	}
 }
@@ -39,24 +41,27 @@ func newProcessor(conn *nats.Conn, msgs <-chan interface{}) *Processor {
 // TODO: Where does the goal come from... this should be loaded from sqlite
 func getGoal() goal {
 	return goal{
-		Containers: []model.Container{
-			{
-				Name:  "my-alpine-hello-world",
-				Image: "alpine:latest",
-				Env:   []string{"NAME=alpine"},
-				Cmd:   []string{"/bin/ash", "-c", "echo Hello from ${NAME}! && tail -f /dev/null"},
+		Containers: map[string]model.Container{
+			"yb44xb1mflxexo41dknhufm7": {
+				ContainerID: "yb44xb1mflxexo41dknhufm7",
+				Name:        "my-alpine-hello-world",
+				Image:       "alpine:latest",
+				Env:         []string{"NAME=alpine"},
+				Cmd:         []string{"/bin/ash", "-c", "echo Hello from ${NAME}! && tail -f /dev/null"},
 			},
-			{
-				Name:  "my-debian-hello-world",
-				Image: "debian:latest",
-				Env:   []string{"NAME=debian"},
-				Cmd:   []string{"/bin/bash", "-c", "echo Hello from ${NAME}! && tail -f /dev/null"},
+			"qc4bhwtbc9w6pad8vs598yon": {
+				ContainerID: "qc4bhwtbc9w6pad8vs598yon",
+				Name:        "my-debian-hello-world",
+				Image:       "debian:latest",
+				Env:         []string{"NAME=debian"},
+				Cmd:         []string{"/bin/bash", "-c", "echo Hello from ${NAME}! && tail -f /dev/null"},
 			},
-			{
-				Name:  "my-ubuntu-hello-world",
-				Image: "ubuntu:latest",
-				Env:   []string{"NAME=ubuntu"},
-				Cmd:   []string{"/bin/bash", "-c", "echo Hello from ${NAME}! && tail -f /dev/null"},
+			"lqysc1uu466zvl6d78fyi4h1": {
+				ContainerID: "lqysc1uu466zvl6d78fyi4h1",
+				Name:        "my-ubuntu-hello-world",
+				Image:       "ubuntu:latest",
+				Env:         []string{"NAME=ubuntu"},
+				Cmd:         []string{"/bin/bash", "-c", "echo Hello from ${NAME}! && tail -f /dev/null"},
 			},
 		},
 	}
@@ -66,14 +71,40 @@ func getGoal() goal {
 func (p *Processor) Process() error {
 	for msg := range p.msgs {
 		switch msg := msg.(type) {
-		case model.NodeUpdate:
+		case model.AgentUpdate:
 			p.nodesMutex.Lock()
-			p.nodes[msg.ID] = msg
+			p.nodes[msg.AgentID] = msg
 			p.nodesMutex.Unlock()
 
-			slog.Info("received message for node update", "msg", msg)
+			for _, c := range msg.Containers {
+				_, err := p.goal.confirmGoalAssignment(c.ContainerID, msg.AgentID)
+				if err != nil {
+					slog.Error("unable to confirm goal assignment during agent update", "err", err)
+				}
+			}
+
+			slog.Info("received message for node update", "agentID", msg.AgentID, "containersCount", len(msg.Containers))
+		case model.Container:
+			confirmedContainer, err := p.goal.confirmGoalAssignment(msg.ContainerID, msg.Assignment.AgentID)
+			if err != nil {
+				slog.Error("unable to confirm goal assignment during container create message", "err", err)
+			}
+
+			// Temporarily assign the container manually to the node. It is temporary because the next time the node updates the controller
+			// this container will be replaced with a very similar container.
+			// TODO: this is interesting because it means that the confirmed at time will contantly be replaced. Initially it will be
+			// set correctly here but when the node posts it's update it will be confirmed again. Maybe this is desirable
+
+			p.nodesMutex.Lock()
+			if n, ok := p.nodes[msg.Assignment.AgentID]; ok {
+				n.Containers = append(n.Containers, confirmedContainer)
+				p.nodes[msg.Assignment.AgentID] = n
+			}
+			p.nodesMutex.Unlock()
+
+			slog.Info("received message confirming container creation", "agentID", msg.Assignment.AgentID, "containerID", msg.ContainerID)
 		default:
-			slog.Warn("unknown message type received", "msg", msg)
+			slog.Warn("unknown message type received")
 		}
 
 		// TODO: After each message reprocess the current state and determine if there are any changes necessary
@@ -90,45 +121,65 @@ func (p *Processor) DetermineStateChanges() error {
 	p.nodesMutex.Lock()
 	defer p.nodesMutex.Unlock()
 
-	var nodeContainerNames []string
+	var nodeContainerIDs []string
 	for _, n := range p.nodes {
 		for _, c := range n.Containers {
-			nodeContainerNames = append(nodeContainerNames, c.Name)
+			nodeContainerIDs = append(nodeContainerIDs, c.ContainerID)
 		}
 	}
 
-	slog.Info("nodeContainerNames", "nodeContainerNames", nodeContainerNames)
+	slog.Info("node", "containerIDs", nodeContainerIDs)
 
-	var goalContainerNames []string
+	var goalContainerIDs []string
 	for _, g := range p.goal.Containers {
-		goalContainerNames = append(goalContainerNames, g.Name)
+		goalContainerIDs = append(goalContainerIDs, g.ContainerID)
 	}
 
-	slog.Info("goalContainerNames", "goalContainerNames", goalContainerNames)
+	slog.Info("goal", "containerIDs", goalContainerIDs)
 
-	for _, c := range nodeContainerNames {
-		if !slices.Contains(goalContainerNames, c) {
-			slog.Info("detected extra container", "container", c)
+	for _, c := range nodeContainerIDs {
+		if !slices.Contains(goalContainerIDs, c) {
+			slog.Info("detected extra container", "name", c)
 			// TODO: Remove the extra container from the node. Remove it from the state so that assigning it to a node takes the removed container into account
 		}
 	}
 
 	nodeIDs := slices.Collect(maps.Keys(p.nodes))
-	for _, c := range p.goal.Containers {
-		if !slices.Contains(nodeContainerNames, c.Name) {
-			slog.Info("detected missing container", "container", c)
+	for cID, c := range p.goal.Containers {
+		// Assigned, unconfirmed, and assigned less than 30 seconds ago. Skip
+		if c.Assignment.AgentID != "" && c.Assignment.ConfirmedAt.IsZero() && time.Since(c.Assignment.AssignedAt) < 30*time.Second {
+			continue
+		}
+
+		if !slices.Contains(nodeContainerIDs, c.ContainerID) {
+			slog.Info("detected missing container", "name", c.Name)
 
 			assignmentNodeID := nodeIDs[rand.Intn(len(nodeIDs))]
 
-			var b bytes.Buffer
-			err := json.NewEncoder(&b).Encode(c)
+			assignedContainer, err := p.goal.updateGoalAssignment(c.ContainerID, assignmentNodeID)
 			if err != nil {
-				panic(err)
+				return err
 			}
+
+			var b bytes.Buffer
+			err = json.NewEncoder(&b).Encode(assignedContainer)
+			if err != nil {
+				return err
+			}
+
+			// We have published a message asking an agent to start a missing container. This needs to be optimistially set in the goal
+			// state that it was completed so any messages that come immediately after this one will think that this part of the goal
+			// is completed. If the node doesn't confirm that the container was created within a specific time frame then it should
+			// be marked as incomplete again
 
 			err = p.natsConnection.Publish(fmt.Sprintf("agent.action.%s", assignmentNodeID), b.Bytes())
 			if err != nil {
-				panic(err)
+				return err
+			}
+
+			_, err = p.goal.updateGoalAssignment(cID, assignmentNodeID)
+			if err != nil {
+				return err
 			}
 
 			// If we have assigned a container to a node stop processing and wait for another message so we
@@ -147,19 +198,41 @@ func (p *Processor) DetermineStateChanges() error {
 	return nil
 }
 
-// func (p *Processor) issueWorkToNodes(ctx context.Context, goal goal) error {
-// 	if len(p.nodes) > 0 {
-// 		slog.Info("No known nodes. Will retry later")
-// 	}
-//
-// 	for i, g := range goal.Containers {
-// 		ni := i % len(s.nodes)
-// 		node := s.nodes[ni]
-// 		err := s.issueCreateContainerRequest(ctx, node.Hostname, g)
-// 		if err != nil {
-// 			return err
-// 		}
-// 	}
-//
-// 	return nil
-// }
+func (g *goal) updateGoalAssignment(containerID, assignedAgentID string) (model.Container, error) {
+	g.goalMutex.Lock()
+	defer g.goalMutex.Unlock()
+
+	if c, ok := g.Containers[containerID]; ok {
+		c.Assignment = model.ContainerAssignment{
+			AgentID:    assignedAgentID,
+			AssignedAt: time.Now(),
+		}
+
+		g.Containers[containerID] = c
+		return c, nil
+	}
+
+	return model.Container{}, fmt.Errorf("unable to update container assignment; container id %s", containerID)
+}
+
+func (g *goal) confirmGoalAssignment(containerID, assignmentAgentID string) (model.Container, error) {
+	g.goalMutex.Lock()
+	defer g.goalMutex.Unlock()
+
+	if c, ok := g.Containers[containerID]; ok {
+		if c.Assignment.ConfirmedAt.IsZero() {
+			slog.Info("confirming assignment for goal container", "containerID", containerID, "assignedAgentID", assignmentAgentID)
+
+			if c.Assignment.AgentID == assignmentAgentID {
+				c.Assignment.ConfirmedAt = time.Now()
+			} else {
+				slog.Warn("received confirmation message from the wrong agent", "expectedID", c.Assignment.AgentID, "receivedID", assignmentAgentID)
+			}
+
+			g.Containers[containerID] = c
+			return c, nil
+		}
+	}
+
+	return model.Container{}, fmt.Errorf("unable to find container to confirm the goal assignment: container id %s", containerID)
+}

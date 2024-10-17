@@ -42,7 +42,7 @@ func main() {
 	}
 	defer natsServer.Shutdown()
 
-	slog.Info("CP: NATS server is ready to accept connections")
+	slog.Info("NATS server is ready to accept connections")
 
 	// Configure context for shutdown handling
 	ctx := context.Background()
@@ -57,7 +57,7 @@ func main() {
 	go func() {
 		select {
 		case <-signalChan: // first signal, cancel context
-			slog.Info("CP: received cancellation. shutting down nats server")
+			slog.Info("received cancellation. shutting down nats server")
 			natsServer.Shutdown()
 			cancel()
 		case <-ctx.Done():
@@ -120,8 +120,8 @@ func setupDB() (*sql.DB, error) {
 
 func setupNATSServer() (*natsserver.Server, error) {
 	opts := &natsserver.Options{
-		Debug: true,
-		Trace: true,
+		Debug: false,
+		Trace: false,
 	}
 	ns, err := natsserver.NewServer(opts)
 	if err != nil {

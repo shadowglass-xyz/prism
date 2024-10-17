@@ -1,5 +1,7 @@
 package model
 
+import "time"
+
 // NodeCommandAction specifies what type of action is being pushed to the node agent
 type NodeCommandAction string
 
@@ -16,24 +18,32 @@ type NodeCommand struct {
 	Container Container
 }
 
-// Container represents a request to create a container
-type Container struct {
-	ID         string            `json:"id"`
-	Name       string            `json:"name"`
-	Image      string            `json:"image"`
-	Env        []string          `json:"env"`
-	Labels     map[string]string `json:"labels"`
-	Entrypoint string            `json:"entrypoint"`
-	Cmd        []string          `json:"cmd"`
-	Status     string            `json:"status"`
+// ContainerAssignment wraps all the fields necessary to assign and reassign containers to agents
+type ContainerAssignment struct {
+	AgentID     string    `json:"agent_id"`
+	AssignedAt  time.Time `json:"assigned_at"`
+	ConfirmedAt time.Time `json:"confirmed_at"`
 }
 
-// NodeUpdate is used to send statistics about a system
-type NodeUpdate struct {
-	ID          string      `json:"id"`
+// Container represents a request to create a container
+type Container struct {
+	ContainerID string              `json:"id"`
+	Name        string              `json:"name"`
+	Image       string              `json:"image"`
+	Env         []string            `json:"env"`
+	Labels      map[string]string   `json:"labels"`
+	Entrypoint  string              `json:"entrypoint"`
+	Cmd         []string            `json:"cmd"`
+	Status      string              `json:"status"`
+	Assignment  ContainerAssignment `json:"assignment"`
+}
+
+// AgentUpdate is used to send statistics about a system
+type AgentUpdate struct {
+	AgentID     string      `json:"agent_id"`
 	Hostname    string      `json:"hostname"`
 	CPUs        int         `json:"cpus"`
-	FreeMemory  uint64      `json:"freeMemory"`
-	TotalMemory uint64      `json:"totalMemory"`
+	FreeMemory  uint64      `json:"free_memory"`
+	TotalMemory uint64      `json:"total_memory"`
 	Containers  []Container `json:"containers"`
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"shadowglass/internal/model"
 
 	"github.com/nats-io/nats.go"
@@ -31,7 +32,7 @@ func newMonitor(conn *nats.Conn, msgs chan<- interface{}) (*monitor, error) {
 
 func (m *monitor) setupSubscriptions() error {
 	sub, err := m.natsConnection.Subscribe("agent.update.*", func(msg *nats.Msg) {
-		var reg model.NodeUpdate
+		var reg model.AgentUpdate
 		err := json.NewDecoder(bytes.NewReader(msg.Data)).Decode(&reg)
 		if err != nil {
 			panic(err)
@@ -45,12 +46,14 @@ func (m *monitor) setupSubscriptions() error {
 
 	m.agentUpdateSubscription = sub
 
-	sub, err = m.natsConnection.Subscribe("agent.controller.create.>", func(msg *nats.Msg) {
+	sub, err = m.natsConnection.Subscribe("agent.container.create.>", func(msg *nats.Msg) {
 		var cont model.Container
 		err := json.NewDecoder(bytes.NewReader(msg.Data)).Decode(&cont)
 		if err != nil {
-			panic(err)
+			slog.Error("unable to decode message on subject", "subject", msg.Sub.Subject)
 		}
+
+		m.msgs <- cont
 	})
 	if err != nil {
 		return err

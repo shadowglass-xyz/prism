@@ -34,7 +34,7 @@ const (
 )
 
 func main() {
-	slog.Info("AGENT: starting", "version", version)
+	slog.Info("starting", "version", version)
 
 	controlPlaneURL := os.Getenv("CONTROL_PLANE_URL")
 	agentID := os.Getenv("PRISM_AGENT_NODE_ID")
@@ -87,7 +87,7 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 	// st := state.New()
 
 	wg.Go(func() error {
-		slog.Info("AGENT: connected to control plane", "url", controlPlaneURL)
+		slog.Info("connected to control plane", "url", controlPlaneURL)
 
 		for {
 			stats, err := gatherSystemUpdateMessage(ctx, cli, agentID)
@@ -101,10 +101,10 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 				return err
 			}
 
-			slog.Info(fmt.Sprintf("AGENT: updated to agent.update.%s", agentID), "update", statsB.String())
+			slog.Info(fmt.Sprintf("send update to agent.update.%s", agentID), "containers", len(stats.Containers))
 			err = con.Publish(fmt.Sprintf("agent.update.%s", agentID), statsB.Bytes())
 			if err != nil {
-				return fmt.Errorf("publishing to agent.update: %w", err)
+				return fmt.Errorf("error publishing to agent.update: %w", err)
 			}
 
 			select {
@@ -120,20 +120,21 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 			var cont model.Container
 			err := json.Unmarshal(msg.Data, &cont)
 			if err != nil {
-				panic(err)
+				slog.Error("unable to unmarshal agent.action", "err", err)
 			}
 
-			slog.Info("AGENT: creating container", "agentID", agentID, "container", cont)
+			slog.Info("received request to create container", "agentID", agentID, "container", cont.Name)
 			l := cont.Labels
 			if l == nil {
 				l = make(map[string]string)
 			}
 			l["controlled-by"] = "prism"
 			l["assigned-agent-id"] = agentID
+			l["prism-container-id"] = cont.ContainerID
 
 			body, err := cli.ImagePull(ctx, cont.Image, image.PullOptions{})
 			if err != nil {
-				panic(err)
+				slog.Error("unable to pull image", "err", err)
 			}
 			defer body.Close()
 
@@ -141,19 +142,21 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 				Filters: filters.NewArgs(filters.KeyValuePair{Key: "name", Value: cont.Name}),
 			})
 			if err != nil {
-				panic(err)
+				slog.Error("unable to list containers", "err", err)
 			}
 
 			for _, c := range clResp {
 				slog.Info("removing duplicate container", "containerNames", c.Names)
 				err := cli.ContainerStop(ctx, c.ID, container.StopOptions{})
 				if err != nil {
-					panic(err)
+					slog.Error("unable to stop container", "err", err)
+					return
 				}
 
 				err = cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{})
 				if err != nil {
-					panic(err)
+					slog.Error("unable to remove container", "err", err)
+					return
 				}
 			}
 
@@ -170,26 +173,27 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 				},
 				&network.NetworkingConfig{},
 				&v1.Platform{},
-				cont.Name,
+				"",
 			)
 			if err != nil {
 				slog.Info("unable to create container", "err", err)
+				return
 			}
 
 			err = cli.ContainerStart(ctx, ccResp.ID, container.StartOptions{})
 			if err != nil {
 				slog.Info("unable to start container", "err", err)
+				return
 			}
-
-			cont.ID = ccResp.ID
 
 			var b bytes.Buffer
 			err = json.NewEncoder(&b).Encode(cont)
 			if err != nil {
 				slog.Info("unable to encode container for response to controller", "err", err)
+				return
 			}
 
-			err = con.Publish(fmt.Sprintf("agent.container.create.%s.%s", agentID, cont.ID), b.Bytes())
+			err = con.Publish(fmt.Sprintf("agent.container.create.%s.%s", agentID, cont.ContainerID), b.Bytes())
 			if err != nil {
 				slog.Info("unable to publish container create message to NATS", "err", err)
 			}
@@ -212,157 +216,16 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 		}
 	})
 
-	// wg.Go(func() error {
-	// 	return dockerReconcileLoop(ctx, cli, hostname, &st)
-	// })
-
 	return wg.Wait()
 }
 
-// func dockerReconcileLoop(ctx context.Context, cli *client.Client, hostname string, st *state.State) error {
-// 	for {
-// 		containers, err := cli.ContainerList(ctx, container.ListOptions{
-// 			All:     true,
-// 			Filters: filters.NewArgs(filters.KeyValuePair{Key: "label", Value: "controlled-by=prism"}),
-// 		})
-// 		if err != nil {
-// 			panic(err)
-// 		}
-//
-// 		existingContainerNames := make([]string, 0, len(containers))
-// 		for _, c := range containers {
-// 			existingContainerNames = append(existingContainerNames, c.Names...)
-// 		}
-//
-// 		slog.Info("Existing container names", "names", existingContainerNames)
-//
-// 		// Loop over requested state to find containers that shouldn't exist
-//
-// 		var missingContainers []string
-// 		var existingContainers []string
-// 		for _, name := range st.Names() {
-// 			if !slices.Contains(existingContainerNames, name) {
-// 				missingContainers = append(missingContainers, name)
-// 			} else {
-// 				existingContainers = append(existingContainers, name)
-// 			}
-// 		}
-//
-// 		slog.Info("Missing containers", "names", missingContainers)
-// 		slog.Info("Existing containers", "names", existingContainers)
-//
-// 		// Loop over existing state to find missing containers
-//
-// 		var extraContainers []string
-// 		for _, name := range existingContainerNames {
-// 			if !slices.Contains(st.Names(), name) {
-// 				extraContainers = append(extraContainers, name)
-// 			}
-// 		}
-//
-// 		slog.Info("Extra containers", "names", extraContainers)
-//
-// 		for _, name := range missingContainers {
-// 			c, ok := st.Get(name)
-// 			if !ok {
-// 				slog.Info("unable to find container %s in state")
-// 			}
-//
-// 			b, err := cli.ImagePull(ctx, c.Image, image.PullOptions{})
-// 			if err != nil {
-// 				panic(err)
-// 			}
-// 			defer b.Close()
-//
-// 			slog.Info("need to create a new container")
-// 			// Container is completely missing so we have to create it
-// 			resp, err := cli.ContainerCreate(ctx,
-// 				&container.Config{
-// 					Image: c.Image,
-// 					Cmd:   c.Cmd,
-// 					Labels: map[string]string{
-// 						"controlled-by": "prism",
-// 						"assigned-host": hostname,
-// 					},
-// 				},
-// 				&container.HostConfig{},
-// 				&network.NetworkingConfig{},
-// 				&v1.Platform{},
-// 				name,
-// 			)
-// 			if err != nil {
-// 				slog.Info("unable to create container", "err", err)
-// 			}
-//
-// 			err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{})
-// 			if err != nil {
-// 				slog.Info("unable to start container", "err", err)
-// 			}
-// 		}
-//
-// 		// for name, c := range state {
-// 		// 	foundContainer := false
-// 		// 	for _, rc := range containers {
-// 		// 		if slices.Contains(rc.Names, name) {
-// 		// 			foundContainer = true
-// 		// 			slog.Info("need to update a container")
-// 		// 			err := cli.ContainerStop(ctx, rc.ID, container.StopOptions{})
-// 		// 			if err != nil {
-// 		// 				slog.Warn("error stopping container", "container", rc, "err", err)
-// 		// 			}
-// 		//
-// 		// 			err = cli.ContainerRemove(ctx, rc.ID, container.RemoveOptions{})
-// 		// 			if err != nil {
-// 		// 				slog.Warn("error removing container", "container", rc, "err", err)
-// 		// 			}
-// 		// 		}
-// 		// 	}
-// 		//
-// 		// 	if !foundContainer {
-// 		// 		b, err := cli.ImagePull(ctx, c.Image, image.PullOptions{})
-// 		// 		if err != nil {
-// 		// 			panic(err)
-// 		// 		}
-// 		// 		defer b.Close()
-// 		//
-// 		// 		slog.Info("need to create a new container")
-// 		// 		// Container is completely missing so we have to create it
-// 		// 		resp, err := cli.ContainerCreate(ctx,
-// 		// 			&container.Config{
-// 		// 				Image: c.Image,
-// 		// 				Cmd:   c.Cmd,
-// 		// 			},
-// 		// 			&container.HostConfig{},
-// 		// 			&network.NetworkingConfig{},
-// 		// 			&v1.Platform{},
-// 		// 			name,
-// 		// 		)
-// 		// 		if err != nil {
-// 		// 			slog.Info("unable to create container", "err", err)
-// 		// 		}
-// 		//
-// 		// 		err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{})
-// 		// 		if err != nil {
-// 		// 			slog.Info("unable to start container", "err", err)
-// 		// 		}
-// 		// 	}
-// 		// }
-//
-// 		select {
-// 		case <-time.After(10 * time.Second):
-// 		case <-ctx.Done():
-// 			return ctx.Err()
-// 		}
-// 	}
-// }
-
-func gatherSystemUpdateMessage(ctx context.Context, cli *client.Client, agentID string) (model.NodeUpdate, error) {
+func gatherSystemUpdateMessage(ctx context.Context, cli *client.Client, agentID string) (model.AgentUpdate, error) {
 	fm := memory.FreeMemory()
 	tm := memory.TotalMemory()
 
 	hostname, err := os.Hostname()
 	if err != nil {
-		return model.NodeUpdate{}, err
+		return model.AgentUpdate{}, err
 	}
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{
@@ -384,18 +247,18 @@ func gatherSystemUpdateMessage(ctx context.Context, cli *client.Client, agentID 
 		}
 
 		mc = append(mc, model.Container{
-			ID:     container.ID,
-			Name:   strings.TrimPrefix(container.Name, "/"),
-			Image:  container.Image,
-			Env:    container.Config.Env,
-			Labels: container.Config.Labels,
-			Cmd:    container.Config.Cmd,
-			Status: container.State.Status,
+			ContainerID: container.ID,
+			Name:        strings.TrimPrefix(container.Name, "/"),
+			Image:       container.Image,
+			Env:         container.Config.Env,
+			Labels:      container.Config.Labels,
+			Cmd:         container.Config.Cmd,
+			Status:      container.State.Status,
 		})
 	}
 
-	return model.NodeUpdate{
-		ID:          agentID,
+	return model.AgentUpdate{
+		AgentID:     agentID,
 		Hostname:    hostname,
 		CPUs:        runtime.NumCPU(),
 		FreeMemory:  fm,
