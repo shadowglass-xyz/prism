@@ -2,19 +2,17 @@ package model
 
 import "time"
 
-// NodeCommandAction specifies what type of action is being pushed to the node agent
-type NodeCommandAction string
+type Action string
 
-// Enum values for possible node command actions
 const (
-	Create NodeCommandAction = "create"
-	Delete NodeCommandAction = "delete"
-	Update NodeCommandAction = "update"
+	ContainerActionCreate Action = "create"
+	ContainerActionUpdate Action = "update"
+	ContainerActionDelete Action = "delete"
 )
 
-// NodeCommand contains changes that should be pushed to the agent internal state. I.E. Add a container, or remove a container
-type NodeCommand struct {
-	Action    NodeCommandAction
+// ContainerAction communicates a desired change to the cluster
+type ContainerAction struct {
+	Action    Action
 	Container Container
 }
 
@@ -38,8 +36,8 @@ type Container struct {
 	Assignment  ContainerAssignment `json:"assignment"`
 }
 
-// AgentUpdate is used to send statistics about a system
-type AgentUpdate struct {
+// Node is used to send statistics about a system
+type Node struct {
 	AgentID     string      `json:"agent_id"`
 	Hostname    string      `json:"hostname"`
 	CPUs        int         `json:"cpus"`

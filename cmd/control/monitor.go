@@ -32,7 +32,7 @@ func newMonitor(conn *nats.Conn, msgs chan<- interface{}) (*monitor, error) {
 
 func (m *monitor) setupSubscriptions() error {
 	sub, err := m.natsConnection.Subscribe("agent.update.*", func(msg *nats.Msg) {
-		var reg model.AgentUpdate
+		var reg model.Node
 		err := json.NewDecoder(bytes.NewReader(msg.Data)).Decode(&reg)
 		if err != nil {
 			panic(err)

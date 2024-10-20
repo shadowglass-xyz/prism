@@ -219,13 +219,13 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 	return wg.Wait()
 }
 
-func gatherSystemUpdateMessage(ctx context.Context, cli *client.Client, agentID string) (model.AgentUpdate, error) {
+func gatherSystemUpdateMessage(ctx context.Context, cli *client.Client, agentID string) (model.Node, error) {
 	fm := memory.FreeMemory()
 	tm := memory.TotalMemory()
 
 	hostname, err := os.Hostname()
 	if err != nil {
-		return model.AgentUpdate{}, err
+		return model.Node{}, err
 	}
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{
@@ -257,7 +257,7 @@ func gatherSystemUpdateMessage(ctx context.Context, cli *client.Client, agentID 
 		})
 	}
 
-	return model.AgentUpdate{
+	return model.Node{
 		AgentID:     agentID,
 		Hostname:    hostname,
 		CPUs:        runtime.NumCPU(),
