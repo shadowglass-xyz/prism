@@ -56,6 +56,8 @@ func New() State {
 	}
 }
 
+// UpdateFromNode takes in a current node and updates the current state from it.
+// It should add missing containers and recognize when a container has been removed from a node.
 func (st *State) UpdateFromNode(n model.Node) {
 	st.nodesMutex.Lock()
 	st.nodeIDs = append(st.nodeIDs, n.AgentID)
