@@ -64,7 +64,6 @@ func (st *State) UpdateFromNode(n model.Node) {
 	st.nodesMutex.Unlock()
 
 	for _, c := range n.Containers {
-		st.UpdateContainer(c)
 		err := st.ConfirmContainer(c.ContainerID, n.AgentID)
 		if err != nil {
 			slog.Error("unable to confirm goal assignment during agent update", "err", err)
@@ -103,21 +102,26 @@ func (st *State) AssignContainer(containerID, agentID string) (model.Container, 
 // to as well as the time it was confirmed
 func (st *State) ConfirmContainer(containerID, agentID string) error {
 	if c, ok := st.current[containerID]; ok {
-		if c.Assignment.ConfirmedAt.IsZero() {
-			slog.Info("confirming assignment for goal container", "containerID", containerID, "assignedAgentID", agentID)
-
-			if c.Assignment.AgentID == agentID {
-				c.Assignment.ConfirmedAt = time.Now()
-			} else {
-				slog.Warn("received confirmation message from the wrong agent", "expectedID", c.Assignment.AgentID, "receivedID", agentID)
-			}
-
-			st.currentMutex.Lock()
-			st.current[containerID] = c
-			st.currentMutex.Unlock()
-
-			return nil
+		if c.Assignment.AgentID == "" || c.Assignment.AgentID != agentID {
+			slog.Info("agentID didn't match confirmation. updating", "assignmentAgentID", c.Assignment.AgentID, "confirmationAgentID", agentID)
+			// this is probably an error
 		}
+
+		c.Assignment.ConfirmedAt = time.Now()
+
+		slog.Info("confirming assignment for goal container", "containerID", containerID, "assignedAgentID", agentID)
+
+		if c.Assignment.AgentID == agentID {
+			c.Assignment.ConfirmedAt = time.Now()
+		} else {
+			slog.Warn("received confirmation message from the wrong agent", "expectedID", c.Assignment.AgentID, "receivedID", agentID)
+		}
+
+		st.currentMutex.Lock()
+		st.current[containerID] = c
+		st.currentMutex.Unlock()
+
+		return nil
 	}
 
 	return fmt.Errorf("unable to find container to confirm the goal assignment: container id %s", containerID)
@@ -158,47 +162,57 @@ func (st *State) GenerateNextAction() (model.ContainerAction, error) {
 	nodeIDs := st.nodeIDs
 
 	for _, c := range st.desired {
-		// Assigned, unconfirmed, and assigned less than 30 seconds ago. Skip
-		if c.Assignment.AgentID != "" && c.Assignment.ConfirmedAt.IsZero() && time.Since(c.Assignment.AssignedAt) < 30*time.Second {
-			continue
-		}
-
-		if !slices.Contains(currentContainerIDs, c.ContainerID) {
-			slog.Info("detected missing container", "name", c.Name)
-
-			assignmentNodeID := nodeIDs[rand.Intn(len(nodeIDs))]
-
-			st.UpdateContainer(c)
-			assignedContainer, err := st.AssignContainer(c.ContainerID, assignmentNodeID)
-			if err != nil {
-				return model.ContainerAction{}, err
+		// If container exists then we need to check it's validity
+		if current, ok := st.current[c.ContainerID]; ok {
+			// Assigned, unconfirmed, and assigned less than 30 seconds ago. Skip
+			if current.Assignment.AgentID != "" && !current.Assignment.ConfirmedAt.IsZero() && time.Since(current.Assignment.ConfirmedAt) < 45*time.Second {
+				slog.Info("container confirmation age", "containerID", current.ContainerID, "age", time.Since(current.Assignment.ConfirmedAt))
+				continue
 			}
 
-			// TODO: this should only generate a single action so that there is time for other things to happen in the system
-			// between assignments. For example. If all the nodes are joining at one time then we want to try and distritube
-			// the containers between the nodes
+			slog.Info("found stale unclaimed container... replacing...")
 
-			return model.ContainerAction{
-				Action:    model.ContainerActionCreate,
-				Container: assignedContainer,
-			}, nil
-
-			// Send the message that we need to create this container on the node. And send it to "agent.action.agentID"
-
-			// TODO: Determine which node to assign the missing container to based on:
-			//   0. Basically useless (round robin assignments)
-			//   1. container count to start (most basic)
-			//   2. Resource usage/requested usage
-
-			// _, err = p.goal.updateGoalAssignment(cID, assignmentNodeID)
-			// if err != nil {
-			// 	return err
-			// }
-
-			// If we have assigned a container to a node stop processing and wait for another message so we
-			// might be able to get containers assigned to another node
-			// return nil
+			c = current
 		}
+
+		// If the container didn't exist then we need to assign it and create it
+		slog.Info("detected missing container", "name", c.Name)
+
+		assignmentNodeID := nodeIDs[rand.Intn(len(nodeIDs))]
+
+		c.Assignment.AgentID = assignmentNodeID
+		c.Assignment.AssignedAt = time.Now()
+
+		st.UpdateContainer(c)
+		assignedContainer, err := st.AssignContainer(c.ContainerID, assignmentNodeID)
+		if err != nil {
+			return model.ContainerAction{}, err
+		}
+
+		// TODO: this should only generate a single action so that there is time for other things to happen in the system
+		// between assignments. For example. If all the nodes are joining at one time then we want to try and distritube
+		// the containers between the nodes
+
+		return model.ContainerAction{
+			Action:    model.ContainerActionCreate,
+			Container: assignedContainer,
+		}, nil
+
+		// Send the message that we need to create this container on the node. And send it to "agent.action.agentID"
+
+		// TODO: Determine which node to assign the missing container to based on:
+		//   0. Basically useless (round robin assignments)
+		//   1. container count to start (most basic)
+		//   2. Resource usage/requested usage
+
+		// _, err = p.goal.updateGoalAssignment(cID, assignmentNodeID)
+		// if err != nil {
+		// 	return err
+		// }
+
+		// If we have assigned a container to a node stop processing and wait for another message so we
+		// might be able to get containers assigned to another node
+		// return nil
 	}
 
 	return model.ContainerAction{}, nil
