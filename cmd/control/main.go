@@ -13,6 +13,7 @@ import (
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/pressly/goose/v3"
 	_ "modernc.org/sqlite"
 )
@@ -45,8 +46,7 @@ func main() {
 	slog.Info("NATS server is ready to accept connections")
 
 	// Configure context for shutdown handling
-	ctx := context.Background()
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt)
 	defer func() {
@@ -57,7 +57,6 @@ func main() {
 	go func() {
 		select {
 		case <-signalChan: // first signal, cancel context
-			slog.Info("received cancellation. shutting down nats server")
 			natsServer.Shutdown()
 			cancel()
 		case <-ctx.Done():
@@ -72,10 +71,23 @@ func main() {
 	}
 	defer conn.Close()
 
+	jsConn, err := jetstream.New(conn)
+	if err != nil {
+		panic(fmt.Sprintf("unable to connect to jetstream: %s", err))
+	}
+
+	kvStore, err := jsConn.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "prism-state",
+	})
+	if err != nil {
+		panic(fmt.Sprintf("unable to create key/value store: %s", err))
+	}
+
 	c := server{
 		db:         db,
 		natsServer: natsServer,
 		natsConn:   conn,
+		store:      kvStore,
 	}
 
 	if err := c.run(ctx); err != nil {
@@ -120,8 +132,10 @@ func setupDB() (*sql.DB, error) {
 
 func setupNATSServer() (*natsserver.Server, error) {
 	opts := &natsserver.Options{
-		Debug: false,
-		Trace: false,
+		Debug:     false,
+		Trace:     false,
+		JetStream: true,
+		StoreDir:  "./storage",
 	}
 	ns, err := natsserver.NewServer(opts)
 	if err != nil {
@@ -133,7 +147,7 @@ func setupNATSServer() (*natsserver.Server, error) {
 	ns.ConfigureLogger()
 
 	maxWait := 4 * time.Second
-	if !ns.ReadyForConnections(4 * time.Second) {
+	if !ns.ReadyForConnections(10 * time.Second) {
 		return nil, fmt.Errorf("nats server wasn't able to accept connections after %s", maxWait)
 	}
 

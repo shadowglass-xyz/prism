@@ -20,6 +20,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pbnjay/memory"
 	"golang.org/x/sync/errgroup"
@@ -72,19 +73,74 @@ func main() {
 func run(ctx context.Context, agentID, controlPlaneURL string) error {
 	wg, ctx := errgroup.WithContext(ctx)
 
-	con, err := nats.Connect(controlPlaneURL)
+	conn, err := nats.Connect(controlPlaneURL)
 	if err != nil {
 		return fmt.Errorf("connecting to control plane: %w", err)
 	}
-	defer con.Close()
+	defer conn.Close()
 
 	cli, err := client.NewClientWithOpts(client.WithVersion("1.46"))
 	if err != nil {
 		return fmt.Errorf("connecting to docker: %w", err)
 	}
 
-	// TODO: retrieve the current state store from NATs. Probably by phoning the control plane and registering
-	// st := state.New()
+	jsConn, err := jetstream.New(conn)
+	if err != nil {
+		return fmt.Errorf("unable to connect to jetstream: %s", err)
+	}
+
+	kvStore, err := jsConn.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "prism-state",
+	})
+	if err != nil {
+		return fmt.Errorf("unable to create key/value store: %s", err)
+	}
+
+	lister, err := kvStore.ListKeys(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to list keys: %s", err)
+	}
+
+	for k := range lister.Keys() {
+		slog.Info("found key", "key", k)
+
+		val, err := kvStore.Get(ctx, k)
+		if err != nil {
+			slog.Error("unable to get kv value", "err", err)
+			return err
+		}
+
+		slog.Info("attempting to assign value to self if unassigned")
+
+		var m model.Container
+		err = json.NewDecoder(bytes.NewReader(val.Value())).Decode(&m)
+		if err != nil {
+			slog.Error("decoding jetstream kv value", "err", err)
+			return err
+		}
+
+		slog.Info("decoded value", "container", m, "agentID", m.Assignment.AgentID)
+
+		if m.Assignment.AgentID == "" {
+			slog.Info("container was unassigned. assigning to self")
+			m.Assignment.AgentID = agentID
+
+			var b bytes.Buffer
+			err = json.NewEncoder(&b).Encode(&m)
+			if err != nil {
+				slog.Error("encoding assigned jetstream value", "err", err)
+				return err
+			}
+
+			newRevision, err := kvStore.Update(ctx, k, b.Bytes(), val.Revision())
+			if err != nil {
+				slog.Error("updating key to record assignment", "key", k, "revision", val.Revision(), "newRevision", newRevision)
+				return err
+			}
+		} else {
+			slog.Info("container was already assigned", "agentID", m.Assignment.AgentID)
+		}
+	}
 
 	wg.Go(func() error {
 		slog.Info("connected to control plane", "url", controlPlaneURL)
@@ -102,7 +158,7 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 			}
 
 			slog.Info(fmt.Sprintf("send update to agent.update.%s", agentID), "containers", len(stats.Containers))
-			err = con.Publish(fmt.Sprintf("agent.update.%s", agentID), statsB.Bytes())
+			err = conn.Publish(fmt.Sprintf("agent.update.%s", agentID), statsB.Bytes())
 			if err != nil {
 				return fmt.Errorf("error publishing to agent.update: %w", err)
 			}
@@ -116,7 +172,7 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 	})
 
 	wg.Go(func() error {
-		_, err := con.Subscribe(fmt.Sprintf("agent.action.%s", agentID), func(msg *nats.Msg) {
+		_, err := conn.Subscribe(fmt.Sprintf("agent.action.%s", agentID), func(msg *nats.Msg) {
 			var cont model.Container
 			err := json.Unmarshal(msg.Data, &cont)
 			if err != nil {
@@ -193,7 +249,7 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 				return
 			}
 
-			err = con.Publish(fmt.Sprintf("agent.container.create.%s.%s", agentID, cont.ContainerID), b.Bytes())
+			err = conn.Publish(fmt.Sprintf("agent.container.create.%s.%s", agentID, cont.ContainerID), b.Bytes())
 			if err != nil {
 				slog.Info("unable to publish container create message to NATS", "err", err)
 			}

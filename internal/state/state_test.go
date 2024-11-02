@@ -20,31 +20,17 @@ func TestState(t *testing.T) {
 			Containers:  []model.Container{},
 		})
 
-		next, err := s.GenerateNextAction()
+		actions, err := s.GenerateNextActions()
 		if err != nil {
 			t.Fatalf("generate actions returned an error: %s", err)
 		}
 
-		if next.Action != model.ContainerActionCreate {
+		if len(actions[0].Action) != 2 {
+			t.Fatalf("expected two actions but received :%d", len(actions[0].Action))
+		}
+
+		if actions[0].Action != model.ContainerActionCreate {
 			t.Fatalf("first action generated should have been a create action")
-		}
-
-		next, err = s.GenerateNextAction()
-		if err != nil {
-			t.Fatalf("generate actions returned an error: %s", err)
-		}
-
-		if next.Action != model.ContainerActionCreate {
-			t.Fatalf("second action generated should have been a create action")
-		}
-
-		next, err = s.GenerateNextAction()
-		if err != nil {
-			t.Fatalf("generate actions returned an error: %s", err)
-		}
-
-		if next.Action != model.ContainerActionCreate {
-			t.Fatalf("third action generated should have been a create action")
 		}
 	})
 
@@ -67,7 +53,7 @@ func TestState(t *testing.T) {
 			},
 		})
 
-		_, err := s.GenerateNextAction()
+		_, err := s.GenerateNextActions()
 		if err != nil {
 			t.Fatalf("generate actions returned an error: %s", err)
 		}
@@ -101,14 +87,14 @@ func TestState(t *testing.T) {
 			},
 		})
 
-		_, err := s.GenerateNextAction()
+		_, err := s.GenerateNextActions()
 		if err != nil {
 			t.Fatalf("generate actions returned an error: %s", err)
 		}
 
 		// TODO: First action should be a delete
 
-		_, err = s.GenerateNextAction()
+		_, err = s.GenerateNextActions()
 		if err != nil {
 			t.Fatalf("generate actions returned an error: %s", err)
 		}

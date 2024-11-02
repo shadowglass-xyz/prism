@@ -21,37 +21,10 @@ type State struct {
 	current      map[string]model.Container
 }
 
-// TODO: Where does the goal come from... this should be loaded from sqlite
-func getDesired() map[string]model.Container {
-	return map[string]model.Container{
-		"yb44xb1mflxexo41dknhufm7": {
-			ContainerID: "yb44xb1mflxexo41dknhufm7",
-			Name:        "my-alpine-hello-world",
-			Image:       "alpine:latest",
-			Env:         []string{"NAME=alpine"},
-			Cmd:         []string{"/bin/ash", "-c", "echo Hello from ${NAME}! && tail -f /dev/null"},
-		},
-		"qc4bhwtbc9w6pad8vs598yon": {
-			ContainerID: "qc4bhwtbc9w6pad8vs598yon",
-			Name:        "my-debian-hello-world",
-			Image:       "debian:latest",
-			Env:         []string{"NAME=debian"},
-			Cmd:         []string{"/bin/bash", "-c", "echo Hello from ${NAME}! && tail -f /dev/null"},
-		},
-		"lqysc1uu466zvl6d78fyi4h1": {
-			ContainerID: "lqysc1uu466zvl6d78fyi4h1",
-			Name:        "my-ubuntu-hello-world",
-			Image:       "ubuntu:latest",
-			Env:         []string{"NAME=ubuntu"},
-			Cmd:         []string{"/bin/bash", "-c", "echo Hello from ${NAME}! && tail -f /dev/null"},
-		},
-	}
-}
-
 // New creates a new representation of state
 func New() State {
 	return State{
-		desired: getDesired(), // TODO: temporary... this should probably be loaded from sqlite
+		// desired: getDesired(), // TODO: temporary... this should probably be loaded from sqlite
 		current: make(map[string]model.Container),
 	}
 }
@@ -127,9 +100,9 @@ func (st *State) ConfirmContainer(containerID, agentID string) error {
 	return fmt.Errorf("unable to find container to confirm the goal assignment: container id %s", containerID)
 }
 
-// GenerateNextAction will take the desired state and the current state and figure out what actions need to be
+// GenerateNextActions will take the desired state and the current state and figure out what actions need to be
 // executed in order to match the states
-func (st *State) GenerateNextAction() (model.ContainerAction, error) {
+func (st *State) GenerateNextActions() ([]model.ContainerAction, error) {
 	var currentContainerIDs []string
 	st.currentMutex.RLock()
 	for _, c := range st.current {
@@ -148,14 +121,15 @@ func (st *State) GenerateNextAction() (model.ContainerAction, error) {
 
 	slog.Info("desired", "containerIDs", desiredContainerIDs)
 
+	var actions []model.ContainerAction
 	for _, c := range currentContainerIDs {
 		if !slices.Contains(desiredContainerIDs, c) {
 			slog.Info("detected extra container", "name", c)
 			// TODO: figure out container deletes
-			// actions = append(actions, model.ContainerAction{
-			// 	Action:    model.ContainerActionDelete,
-			// 	Container: st.current[c],
-			// })
+			actions = append(actions, model.ContainerAction{
+				Action:    model.ContainerActionDelete,
+				Container: st.current[c],
+			})
 		}
 	}
 
@@ -166,7 +140,7 @@ func (st *State) GenerateNextAction() (model.ContainerAction, error) {
 		if current, ok := st.current[c.ContainerID]; ok {
 			// Assigned, unconfirmed, and assigned less than 30 seconds ago. Skip
 			if current.Assignment.AgentID != "" && !current.Assignment.ConfirmedAt.IsZero() && time.Since(current.Assignment.ConfirmedAt) < 45*time.Second {
-				slog.Info("container confirmation age", "containerID", current.ContainerID, "age", time.Since(current.Assignment.ConfirmedAt))
+				// slog.Info("container confirmation age", "containerID", current.ContainerID, "age", time.Since(current.Assignment.ConfirmedAt))
 				continue
 			}
 
@@ -186,17 +160,17 @@ func (st *State) GenerateNextAction() (model.ContainerAction, error) {
 		st.UpdateContainer(c)
 		assignedContainer, err := st.AssignContainer(c.ContainerID, assignmentNodeID)
 		if err != nil {
-			return model.ContainerAction{}, err
+			return nil, err
 		}
 
 		// TODO: this should only generate a single action so that there is time for other things to happen in the system
 		// between assignments. For example. If all the nodes are joining at one time then we want to try and distritube
 		// the containers between the nodes
 
-		return model.ContainerAction{
+		actions = append(actions, model.ContainerAction{
 			Action:    model.ContainerActionCreate,
 			Container: assignedContainer,
-		}, nil
+		})
 
 		// Send the message that we need to create this container on the node. And send it to "agent.action.agentID"
 
@@ -215,5 +189,5 @@ func (st *State) GenerateNextAction() (model.ContainerAction, error) {
 		// return nil
 	}
 
-	return model.ContainerAction{}, nil
+	return actions, nil
 }

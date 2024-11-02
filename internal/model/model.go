@@ -25,15 +25,16 @@ type ContainerAssignment struct {
 
 // Container represents a request to create a container
 type Container struct {
-	ContainerID string              `json:"id"`
-	Name        string              `json:"name"`
-	Image       string              `json:"image"`
-	Env         []string            `json:"env"`
-	Labels      map[string]string   `json:"labels"`
-	Entrypoint  string              `json:"entrypoint"`
-	Cmd         []string            `json:"cmd"`
-	Status      string              `json:"status"`
-	Assignment  ContainerAssignment `json:"assignment"`
+	ContainerID string            `json:"id"`
+	Name        string            `json:"name"`
+	Image       string            `json:"image"`
+	Env         []string          `json:"env"`
+	Labels      map[string]string `json:"labels"`
+	Entrypoint  string            `json:"entrypoint"`
+	Cmd         []string          `json:"cmd"`
+	Status      string            `json:"status"`
+	// Assignment is an assignment
+	Assignment ContainerAssignment `json:"assignment"`
 }
 
 // Node is used to send statistics about a system

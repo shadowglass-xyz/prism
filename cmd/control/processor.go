@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -33,40 +34,45 @@ func newProcessor(conn *nats.Conn, msgs <-chan interface{}) *Processor {
 }
 
 // Process receives messages, updates state, and issues any commands necessary
-func (p *Processor) Process() error {
-	for msg := range p.msgs {
-		switch msg := msg.(type) {
-		case model.Node:
-			p.state.UpdateFromNode(msg)
-		case model.Container:
-			err := p.state.ConfirmContainer(msg.ContainerID, msg.Assignment.AgentID)
-			if err != nil {
-				slog.Error("unable to confirm goal assignment during container create message", "err", err)
+func (p *Processor) Process(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case msg := <-p.msgs:
+			switch msg := msg.(type) {
+			case model.Node:
+				p.state.UpdateFromNode(msg)
+			case model.Container:
+				err := p.state.ConfirmContainer(msg.ContainerID, msg.Assignment.AgentID)
+				if err != nil {
+					slog.Error("unable to confirm goal assignment during container create message", "err", err)
+				}
+
+				slog.Info("received message confirming container creation", "agentID", msg.Assignment.AgentID, "containerID", msg.ContainerID)
+			default:
+				slog.Warn("unknown message type received")
 			}
 
-			slog.Info("received message confirming container creation", "agentID", msg.Assignment.AgentID, "containerID", msg.ContainerID)
-		default:
-			slog.Warn("unknown message type received")
-		}
-
-		next, err := p.state.GenerateNextAction()
-		if err != nil {
-			slog.Error("unable to generate required actions", "err", err)
-		}
-
-		if next.Action == model.ContainerActionCreate {
-			var b bytes.Buffer
-			err = json.NewEncoder(&b).Encode(next.Container)
+			actions, err := p.state.GenerateNextActions()
 			if err != nil {
-				return err
+				slog.Error("unable to generate required actions", "err", err)
 			}
 
-			err = p.natsConnection.Publish(fmt.Sprintf("agent.action.%s", next.Container.Assignment.AgentID), b.Bytes())
-			if err != nil {
-				return err
+			for _, action := range actions {
+				if action.Action == model.ContainerActionCreate {
+					var b bytes.Buffer
+					err = json.NewEncoder(&b).Encode(action.Container)
+					if err != nil {
+						return err
+					}
+
+					err = p.natsConnection.Publish(fmt.Sprintf("agent.action.%s", action.Container.Assignment.AgentID), b.Bytes())
+					if err != nil {
+						return err
+					}
+				}
 			}
 		}
 	}
-
-	return nil
 }
