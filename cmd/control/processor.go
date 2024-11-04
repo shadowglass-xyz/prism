@@ -8,15 +8,9 @@ import (
 	"log/slog"
 	"shadowglass/internal/model"
 	"shadowglass/internal/state"
-	"sync"
 
 	"github.com/nats-io/nats.go"
 )
-
-type goal struct {
-	goalMutex  sync.Mutex
-	Containers map[string]model.Container
-}
 
 // Processor provides dependencies necessary to process incoming messages
 type Processor struct {

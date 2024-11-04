@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -89,22 +90,33 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 		return fmt.Errorf("unable to connect to jetstream: %s", err)
 	}
 
-	kvStore, err := jsConn.CreateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket: "prism-state",
-	})
+	kvState, err := jsConn.KeyValue(ctx, "prism-state")
 	if err != nil {
-		return fmt.Errorf("unable to create key/value store: %s", err)
+		return fmt.Errorf("unable to connect to key/value store prism-state: %s", err)
 	}
 
-	lister, err := kvStore.ListKeys(ctx)
+	kvClaims, err := jsConn.KeyValue(ctx, "prism-claims")
+	if err != nil {
+		return fmt.Errorf("unable to connect to key/value store prism-claims: %s", err)
+	}
+
+	lister, err := kvState.ListKeys(ctx)
 	if err != nil {
 		return fmt.Errorf("unable to list keys: %s", err)
 	}
 
+	// There are two buckets one for the data and one for the claims
+	// If the agent finds a container that it can manage then it should
+	// attempt to create a record in the claims bucket. The claims bucket
+	// has a ttl of 30 seconds (this controls how quickly containers can
+	// be reassigned when an agent goes away).
+
+	var claimedContainerKeys []string
+
 	for k := range lister.Keys() {
 		slog.Info("found key", "key", k)
 
-		val, err := kvStore.Get(ctx, k)
+		val, err := kvState.Get(ctx, k)
 		if err != nil {
 			slog.Error("unable to get kv value", "err", err)
 			return err
@@ -119,28 +131,68 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 			return err
 		}
 
-		slog.Info("decoded value", "container", m, "agentID", m.Assignment.AgentID)
+		containerClaimKey := fmt.Sprintf("container.%s", m.ContainerID)
 
-		if m.Assignment.AgentID == "" {
-			slog.Info("container was unassigned. assigning to self")
-			m.Assignment.AgentID = agentID
-
-			var b bytes.Buffer
-			err = json.NewEncoder(&b).Encode(&m)
-			if err != nil {
-				slog.Error("encoding assigned jetstream value", "err", err)
-				return err
-			}
-
-			newRevision, err := kvStore.Update(ctx, k, b.Bytes(), val.Revision())
-			if err != nil {
-				slog.Error("updating key to record assignment", "key", k, "revision", val.Revision(), "newRevision", newRevision)
-				return err
-			}
-		} else {
-			slog.Info("container was already assigned", "agentID", m.Assignment.AgentID)
+		// Attempt to claim this container. If the create/claim fails then it was already claimed.
+		var assignment model.ContainerAssignment
+		assignment.AgentID = agentID
+		assignment.AssignedAt = time.Now()
+		assignment.ConfirmedAt = time.Now()
+		var b bytes.Buffer
+		err = json.NewEncoder(&b).Encode(assignment)
+		if err != nil {
+			slog.Error("unable to encode assignment value", "err", err)
+			continue
 		}
+
+		_, err = kvClaims.Create(ctx, containerClaimKey, b.Bytes())
+		if errors.Is(err, jetstream.ErrKeyExists) {
+			// container has already been claimed so move onto the next one
+			slog.Warn("container already claimed. moving on", "key", containerClaimKey)
+			continue
+		}
+
+		slog.Info("container claimed", "key", containerClaimKey)
+
+		claimedContainerKeys = append(claimedContainerKeys, containerClaimKey)
+
+		// slow down a bit to allow other agents to claim containers
+		<-time.After(time.Second)
 	}
+
+	wg.Go(func() error {
+		for {
+			for _, claimedContainerKey := range claimedContainerKeys {
+				entry, err := kvClaims.Get(ctx, claimedContainerKey)
+				if err != nil {
+					slog.Error("touching claim key failed", "key", claimedContainerKey, "err", err)
+				}
+
+				var assignment model.ContainerAssignment
+				err = json.NewDecoder(bytes.NewReader(entry.Value())).Decode(&assignment)
+				if err != nil {
+					slog.Error("decoding container assignment from claim", "err", err)
+				}
+
+				assignment.ConfirmedAt = time.Now()
+
+				var b bytes.Buffer
+				err = json.NewEncoder(&b).Encode(assignment)
+				if err != nil {
+					slog.Error("encoding updated confirmed assignment", "err", err)
+				}
+
+				_, err = kvClaims.Update(ctx, claimedContainerKey, b.Bytes(), entry.Revision())
+				if err != nil {
+					slog.Error("updating claim on container key", "err", err)
+				}
+
+				slog.Info("touched claim", "key", claimedContainerKey)
+			}
+
+			<-time.After(15 * time.Second)
+		}
+	})
 
 	wg.Go(func() error {
 		slog.Info("connected to control plane", "url", controlPlaneURL)

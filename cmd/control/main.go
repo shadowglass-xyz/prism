@@ -80,7 +80,15 @@ func main() {
 		Bucket: "prism-state",
 	})
 	if err != nil {
-		panic(fmt.Sprintf("unable to create key/value store: %s", err))
+		panic(fmt.Sprintf("unable to create key/value state store: %s", err))
+	}
+
+	_, err = jsConn.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "prism-claims",
+		TTL:    30 * time.Second,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("unable to create key/value claims store: %s", err))
 	}
 
 	c := server{
