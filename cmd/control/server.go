@@ -8,12 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"shadowglass/internal/model"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/shadowglass-xyz/prism/internal/model"
 )
 
 type server struct {

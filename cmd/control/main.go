@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"shadowglass"
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
@@ -16,6 +15,8 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/pressly/goose/v3"
 	_ "modernc.org/sqlite"
+
+	shadowglass "github.com/shadowglass-xyz/prism"
 )
 
 const (

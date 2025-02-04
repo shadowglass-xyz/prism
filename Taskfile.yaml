@@ -3,12 +3,17 @@ version: '3'
 tasks:
   control:
     cmds:
-      - go run shadowglass/cmd/control
+      - go run github.com/shadowglass-xyz/prism/cmd/control
 
-  agents:
+  agent:
+    env:
+      CONTROL_PLANE_URL: http://localhost:4222
     ignore_error: true
     cmds:
-      - GOOS=linux GOARCH=arm64 go build -o build/agent shadowglass/cmd/agent
-      - docker compose up
+      - go run github.com/shadowglass-xyz/prism/cmd/agent
 
-# vim: ts=4 sts=4 sw=4 et
+  tui:
+    cmds:
+      - go run github.com/shadowglass-xyz/prism/cmd/tui
+
+# vim: ts=2 sts=2 sw=2 et

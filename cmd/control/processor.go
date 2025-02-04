@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"shadowglass/internal/model"
-	"shadowglass/internal/state"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/shadowglass-xyz/prism/internal/model"
+	"github.com/shadowglass-xyz/prism/internal/state"
 )
 
 // Processor provides dependencies necessary to process incoming messages

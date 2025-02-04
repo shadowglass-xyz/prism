@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/rpc"
 	"os"
 	"os/signal"
 	"runtime"
-	"shadowglass/internal/id"
-	"shadowglass/internal/model"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -25,24 +27,69 @@ import (
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pbnjay/memory"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/shadowglass-xyz/prism/internal/id"
+	"github.com/shadowglass-xyz/prism/internal/model"
+	irpc "github.com/shadowglass-xyz/prism/internal/rpc"
 )
 
 const (
-	defaultVersionCheckURL = "http://localhost:8080/updates/"
-	version                = "0.3.4"
-	exitCodeErr            = 1
-	exitCodeInterrupt      = 2
-	dockerVersion          = "1.47"
+	version           = "0.3.4"
+	exitCodeErr       = 1
+	exitCodeInterrupt = 2
+	dockerVersion     = "1.47"
 )
 
-func main() {
-	slog.Info("starting", "version", version)
+type State struct {
+	mu         sync.RWMutex
+	containers map[string]struct{}
+	claims     map[string]struct{}
+}
 
+func (st *State) Agent(_ irpc.AgentStateArgs, reply *irpc.AgentStateReply) error {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	*reply = irpc.AgentStateReply{
+		Containers: st.containers,
+		Claims:     st.claims,
+	}
+	return nil
+}
+
+func (st *State) RemoveClaim(args irpc.RemoveClaimArgs, reply *irpc.RemoveClaimReply) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	delete(st.claims, args.Claim)
+	*reply = irpc.RemoveClaimReply{
+		Success:    true,
+		Containers: st.containers,
+		Claims:     st.claims,
+	}
+	return nil
+}
+
+func (st *State) AddClaim(args irpc.AddClaimArgs, reply *irpc.AddClaimReply) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.claims[args.Claim] = struct{}{}
+	*reply = irpc.AddClaimReply{
+		Success:    true,
+		Containers: st.containers,
+		Claims:     st.claims,
+	}
+	return nil
+}
+
+func main() {
 	controlPlaneURL := os.Getenv("CONTROL_PLANE_URL")
 	agentID := os.Getenv("PRISM_AGENT_NODE_ID")
 	if agentID == "" {
 		agentID = id.Generate()
 	}
+
+	// Create custom slog handler
+	logger := slog.With(slog.String("agentID", agentID))
+	logger.Info("starting", "version", version)
 
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
@@ -56,23 +103,47 @@ func main() {
 	go func() {
 		select {
 		case <-signalChan:
-			slog.Info("received first kill signal, cancel context")
+			logger.Info("received first kill signal, cancel context")
 			cancel()
 		case <-ctx.Done():
 		}
-		slog.Info("received second kill signal, hard exit")
+		logger.Info("received second kill signal, hard exit")
 		<-signalChan
 		os.Exit(exitCodeInterrupt)
 	}()
 
-	if err := run(ctx, agentID, controlPlaneURL); err != nil {
+	if err := run(ctx, logger, agentID, controlPlaneURL); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(exitCodeErr)
 	}
 }
 
-func run(ctx context.Context, agentID, controlPlaneURL string) error {
+// Agent needs to be rewritten.
+// It should pull all known containers from the controller every 15 seconds
+// It should separately pull all known claims and refresh them every 15 seconds
+// It should separately renew claims every 15 seconds
+// If there are any unclaimed containers that the agent can process then they
+//    should be claimed and their docker containers started
+// If the tui connects then the claiming process will be put into manual mode
+// If the tui requests that a container be claimed then it will claimed and the
+//    renewal process will renew those claims every 15 seconds
+// If the tui requests that a containers claim be dropped it will stop renewing
+//    the claim and within 30 seconds the container will be available to be
+//    picked up by another agent
+// Future state, polling should be unnecessary. All the kv buckets can be
+//    subscribed to and notifications received as soon as a new container is
+//    available or a claim is dropped.
+// Future state, the claim doesn't need to expire naturally the agent should
+//    notify the controller during shutdown or claim delete so another agent
+//    can pick it up immediately
+
+func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL string) error {
 	wg, ctx := errgroup.WithContext(ctx)
+
+	state := State{
+		containers: make(map[string]struct{}),
+		claims:     make(map[string]struct{}),
+	}
 
 	conn, err := nats.Connect(controlPlaneURL)
 	if err != nil {
@@ -111,67 +182,112 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 	// has a ttl of 30 seconds (this controls how quickly containers can
 	// be reassigned when an agent goes away).
 
-	var claimedContainerKeys []string
-
-	for k := range lister.Keys() {
-		slog.Info("found key", "key", k)
-
-		val, err := kvState.Get(ctx, k)
+	var activeConnections atomic.Int32
+	wg.Go(func() error {
+		server := rpc.NewServer()
+		err := server.Register(&state)
 		if err != nil {
-			slog.Error("unable to get kv value", "err", err)
-			return err
+			return fmt.Errorf("rpc register: %w", err)
 		}
-
-		slog.Info("attempting to assign value to self if unassigned")
-
-		var m model.Container
-		err = json.NewDecoder(bytes.NewReader(val.Value())).Decode(&m)
+		l, err := net.Listen("tcp", ":11245")
 		if err != nil {
-			slog.Error("decoding jetstream kv value", "err", err)
-			return err
+			return fmt.Errorf("listen error: %w", err)
 		}
 
-		containerClaimKey := fmt.Sprintf("container.%s", m.ContainerID)
+		// Accept and serve connections
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				logger.Error("Accept error", slog.Any("err", err))
+				continue
+			}
 
-		// Attempt to claim this container. If the create/claim fails then it was already claimed.
-		var assignment model.ContainerAssignment
-		assignment.AgentID = agentID
-		assignment.AssignedAt = time.Now()
-		assignment.ConfirmedAt = time.Now()
-		var b bytes.Buffer
-		err = json.NewEncoder(&b).Encode(assignment)
-		if err != nil {
-			slog.Error("unable to encode assignment value", "err", err)
-			continue
+			logger.Info("New connection", slog.String("addr", conn.RemoteAddr().String()))
+			activeConnections.Add(1)
+
+			// Handle the connection in a goroutine
+			go func() {
+				server.ServeConn(conn)
+				logger.Info("Connection closed", slog.String("addr", conn.RemoteAddr().String()))
+				activeConnections.Add(-1)
+			}()
 		}
+	})
 
-		_, err = kvClaims.Create(ctx, containerClaimKey, b.Bytes())
-		if errors.Is(err, jetstream.ErrKeyExists) {
-			// container has already been claimed so move onto the next one
-			slog.Warn("container already claimed. moving on", "key", containerClaimKey)
-			continue
-		}
-
-		slog.Info("container claimed", "key", containerClaimKey)
-
-		claimedContainerKeys = append(claimedContainerKeys, containerClaimKey)
-
-		// slow down a bit to allow other agents to claim containers
-		<-time.After(time.Second)
-	}
-
+	// Search for any additional containers to claim
 	wg.Go(func() error {
 		for {
-			for _, claimedContainerKey := range claimedContainerKeys {
+			logger.Debug("current state", slog.Any("state", &state))
+			if activeConnections.Load() > 0 {
+				logger.Info("agent is in manual mode due to an established rpc connection", slog.Int("connections", int(activeConnections.Load())))
+			} else {
+				for k := range lister.Keys() {
+					logger.Info("found key", "key", k)
+
+					val, err := kvState.Get(ctx, k)
+					if err != nil {
+						logger.Error("unable to get kv value", "err", err)
+						return err
+					}
+
+					logger.Info("attempting to assign value to self if unassigned")
+
+					var m model.Container
+					err = json.NewDecoder(bytes.NewReader(val.Value())).Decode(&m)
+					if err != nil {
+						logger.Error("decoding jetstream kv value", "err", err)
+						return err
+					}
+
+					containerClaimKey := fmt.Sprintf("container.%s", m.ContainerID)
+					state.containers[containerClaimKey] = struct{}{}
+
+					// Attempt to claim this container. If the create/claim fails then it was already claimed.
+					var assignment model.ContainerAssignment
+					assignment.AgentID = agentID
+					assignment.AssignedAt = time.Now()
+					assignment.ConfirmedAt = time.Now()
+					var b bytes.Buffer
+					err = json.NewEncoder(&b).Encode(assignment)
+					if err != nil {
+						logger.Error("unable to encode assignment value", "err", err)
+						continue
+					}
+
+					_, err = kvClaims.Create(ctx, containerClaimKey, b.Bytes())
+					if errors.Is(err, jetstream.ErrKeyExists) {
+						// container has already been claimed so move onto the next one
+						logger.Warn("container already claimed. moving on", "key", containerClaimKey)
+						continue
+					}
+
+					logger.Info("container claimed", "key", containerClaimKey)
+
+					state.claims[containerClaimKey] = struct{}{}
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(15 * time.Second):
+			}
+		}
+	})
+
+	// Push still alive message to controller
+	wg.Go(func() error {
+		for {
+			for claimedContainerKey := range state.claims {
 				entry, err := kvClaims.Get(ctx, claimedContainerKey)
 				if err != nil {
-					slog.Error("touching claim key failed", "key", claimedContainerKey, "err", err)
+					logger.Error("touching claim key failed", "key", claimedContainerKey, "err", err)
 				}
 
 				var assignment model.ContainerAssignment
 				err = json.NewDecoder(bytes.NewReader(entry.Value())).Decode(&assignment)
 				if err != nil {
-					slog.Error("decoding container assignment from claim", "err", err)
+					logger.Error("decoding container assignment from claim", "err", err)
 				}
 
 				assignment.ConfirmedAt = time.Now()
@@ -179,23 +295,24 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 				var b bytes.Buffer
 				err = json.NewEncoder(&b).Encode(assignment)
 				if err != nil {
-					slog.Error("encoding updated confirmed assignment", "err", err)
+					logger.Error("encoding updated confirmed assignment", "err", err)
 				}
 
 				_, err = kvClaims.Update(ctx, claimedContainerKey, b.Bytes(), entry.Revision())
 				if err != nil {
-					slog.Error("updating claim on container key", "err", err)
+					logger.Error("updating claim on container key", "err", err)
 				}
 
-				slog.Info("touched claim", "key", claimedContainerKey)
+				logger.Info("touched claim", "key", claimedContainerKey)
 			}
 
 			<-time.After(15 * time.Second)
 		}
 	})
 
+	// Publish health metrics to controller
 	wg.Go(func() error {
-		slog.Info("connected to control plane", "url", controlPlaneURL)
+		logger.Info("connected to control plane", "url", controlPlaneURL)
 
 		for {
 			stats, err := gatherSystemUpdateMessage(ctx, cli, agentID)
@@ -209,7 +326,7 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 				return err
 			}
 
-			slog.Info(fmt.Sprintf("send update to agent.update.%s", agentID), "containers", len(stats.Containers))
+			logger.Info(fmt.Sprintf("send update to agent.update.%s", agentID), "containers", len(stats.Containers))
 			err = conn.Publish(fmt.Sprintf("agent.update.%s", agentID), statsB.Bytes())
 			if err != nil {
 				return fmt.Errorf("error publishing to agent.update: %w", err)
@@ -223,15 +340,16 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 		}
 	})
 
+	// Old way was to be told by the controller that we needed to run a container
 	wg.Go(func() error {
 		_, err := conn.Subscribe(fmt.Sprintf("agent.action.%s", agentID), func(msg *nats.Msg) {
 			var cont model.Container
 			err := json.Unmarshal(msg.Data, &cont)
 			if err != nil {
-				slog.Error("unable to unmarshal agent.action", "err", err)
+				logger.Error("unable to unmarshal agent.action", "err", err)
 			}
 
-			slog.Info("received request to create container", "agentID", agentID, "container", cont.Name)
+			logger.Info("received request to create container", "agentID", agentID, "container", cont.Name)
 			l := cont.Labels
 			if l == nil {
 				l = make(map[string]string)
@@ -242,7 +360,7 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 
 			body, err := cli.ImagePull(ctx, cont.Image, image.PullOptions{})
 			if err != nil {
-				slog.Error("unable to pull image", "err", err)
+				logger.Error("unable to pull image", "err", err)
 			}
 			defer body.Close()
 
@@ -250,20 +368,20 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 				Filters: filters.NewArgs(filters.KeyValuePair{Key: "name", Value: cont.Name}),
 			})
 			if err != nil {
-				slog.Error("unable to list containers", "err", err)
+				logger.Error("unable to list containers", "err", err)
 			}
 
 			for _, c := range clResp {
-				slog.Info("removing duplicate container", "containerNames", c.Names)
+				logger.Info("removing duplicate container", "containerNames", c.Names)
 				err := cli.ContainerStop(ctx, c.ID, container.StopOptions{})
 				if err != nil {
-					slog.Error("unable to stop container", "err", err)
+					logger.Error("unable to stop container", "err", err)
 					return
 				}
 
 				err = cli.ContainerRemove(ctx, c.ID, container.RemoveOptions{})
 				if err != nil {
-					slog.Error("unable to remove container", "err", err)
+					logger.Error("unable to remove container", "err", err)
 					return
 				}
 			}
@@ -284,26 +402,26 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 				"", // blank container name will be auto generated by docker
 			)
 			if err != nil {
-				slog.Info("unable to create container", "err", err)
+				logger.Info("unable to create container", "err", err)
 				return
 			}
 
 			err = cli.ContainerStart(ctx, ccResp.ID, container.StartOptions{})
 			if err != nil {
-				slog.Info("unable to start container", "err", err)
+				logger.Info("unable to start container", "err", err)
 				return
 			}
 
 			var b bytes.Buffer
 			err = json.NewEncoder(&b).Encode(cont)
 			if err != nil {
-				slog.Info("unable to encode container for response to controller", "err", err)
+				logger.Info("unable to encode container for response to controller", "err", err)
 				return
 			}
 
 			err = conn.Publish(fmt.Sprintf("agent.container.create.%s.%s", agentID, cont.ContainerID), b.Bytes())
 			if err != nil {
-				slog.Info("unable to publish container create message to NATS", "err", err)
+				logger.Info("unable to publish container create message to NATS", "err", err)
 			}
 		})
 		if err != nil {
@@ -311,17 +429,6 @@ func run(ctx context.Context, agentID, controlPlaneURL string) error {
 		}
 
 		return nil
-	})
-
-	wg.Go(func() error {
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(1 * time.Minute):
-				slog.Info("AGENT: running")
-			}
-		}
 	})
 
 	return wg.Wait()

@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
-	"shadowglass/internal/model"
 
 	"github.com/nats-io/nats.go"
+
+	"github.com/shadowglass-xyz/prism/internal/model"
 )
 
 type monitor struct {

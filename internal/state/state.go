@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
-	"shadowglass/internal/model"
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/shadowglass-xyz/prism/internal/model"
 )
 
 // State represents the internal representation of state. It needs to be goroutine safe

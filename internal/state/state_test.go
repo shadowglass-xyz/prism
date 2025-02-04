@@ -1,9 +1,10 @@
 package state
 
 import (
-	"shadowglass/internal/id"
-	"shadowglass/internal/model"
 	"testing"
+
+	"github.com/shadowglass-xyz/prism/internal/id"
+	"github.com/shadowglass-xyz/prism/internal/model"
 )
 
 func TestState(t *testing.T) {
