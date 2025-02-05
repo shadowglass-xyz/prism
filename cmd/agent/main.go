@@ -41,9 +41,10 @@ const (
 )
 
 type State struct {
-	mu         sync.RWMutex
-	containers map[string]struct{}
-	claims     map[string]struct{}
+	mu                sync.RWMutex
+	containers        map[string]struct{}
+	claims            map[string]struct{}
+	activeConnections atomic.Int32
 }
 
 func (st *State) Agent(_ irpc.AgentStateArgs, reply *irpc.AgentStateReply) error {
@@ -118,24 +119,201 @@ func main() {
 	}
 }
 
-// Agent needs to be rewritten.
-// It should pull all known containers from the controller every 15 seconds
-// It should separately pull all known claims and refresh them every 15 seconds
-// It should separately renew claims every 15 seconds
-// If there are any unclaimed containers that the agent can process then they
-//    should be claimed and their docker containers started
-// If the tui connects then the claiming process will be put into manual mode
-// If the tui requests that a container be claimed then it will claimed and the
-//    renewal process will renew those claims every 15 seconds
-// If the tui requests that a containers claim be dropped it will stop renewing
-//    the claim and within 30 seconds the container will be available to be
-//    picked up by another agent
-// Future state, polling should be unnecessary. All the kv buckets can be
-//    subscribed to and notifications received as soon as a new container is
-//    available or a claim is dropped.
-// Future state, the claim doesn't need to expire naturally the agent should
-//    notify the controller during shutdown or claim delete so another agent
-//    can pick it up immediately
+func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL string) error {
+	state := State{
+		containers:        make(map[string]struct{}),
+		claims:            make(map[string]struct{}),
+		activeConnections: atomic.Int32{},
+	}
+
+	conn, err := nats.Connect(controlPlaneURL)
+	if err != nil {
+		return fmt.Errorf("connecting to control plane: %w", err)
+	}
+	defer conn.Close()
+
+	cli, err := client.NewClientWithOpts(client.WithVersion("1.46"))
+	if err != nil {
+		return fmt.Errorf("connecting to docker: %w", err)
+	}
+
+	jsConn, err := jetstream.New(conn)
+	if err != nil {
+		return fmt.Errorf("unable to connect to jetstream: %s", err)
+	}
+
+	kvState, err := jsConn.KeyValue(ctx, "prism-state")
+	if err != nil {
+		return fmt.Errorf("unable to connect to key/value store prism-state: %s", err)
+	}
+
+	kvClaims, err := jsConn.KeyValue(ctx, "prism-claims")
+	if err != nil {
+		return fmt.Errorf("unable to connect to key/value store prism-claims: %s", err)
+	}
+
+	foundContainers := make(chan model.Container, 1)
+
+	wg, ctx := errgroup.WithContext(ctx)
+	wg.Go(func() error {
+		defer close(foundContainers)
+		// It should pull all known containers from the controller every 15 seconds
+		for {
+			logger.Info("updating known containers")
+			updateKnownContainers(ctx, logger, kvState, foundContainers)
+
+			select {
+			case <-time.After(15 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+
+	foundClaims := make(chan model.ContainerAssignment, 1)
+
+	wg.Go(func() error {
+		defer close(foundClaims)
+		// It should separately pull all known claims and refresh them every 15 seconds
+		for {
+			logger.Info("updating known claims")
+			updateKnownClaims(ctx, logger, kvClaims, foundClaims)
+
+			select {
+			case <-time.After(15 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+
+	wg.Go(func() error {
+		// If there are any unclaimed containers that the agent can process then they
+		//	should be claimed and their docker containers started
+		return nil
+	})
+
+	wg.Go(func() error {
+		// It should separately renew owned claims every 15 seconds
+		return nil
+	})
+
+	wg.Go(func() error {
+		// Publish health metrics to controller
+		return nil
+	})
+
+	wg.Go(func() error {
+		// If the tui connects then the claiming process will be put into manual mode
+		server := rpc.NewServer()
+		err := server.Register(&state)
+		if err != nil {
+			return fmt.Errorf("rpc register: %w", err)
+		}
+		l, err := net.Listen("tcp", ":11245")
+		if err != nil {
+			return fmt.Errorf("listen error: %w", err)
+		}
+
+		// Accept and serve connections
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				logger.Error("Accept error", slog.Any("err", err))
+				continue
+			}
+
+			logger.Info("New connection", slog.String("addr", conn.RemoteAddr().String()))
+			state.activeConnections.Add(1)
+
+			// Handle the connection in a goroutine
+			go func() {
+				server.ServeConn(conn)
+				logger.Info("Connection closed", slog.String("addr", conn.RemoteAddr().String()))
+				state.activeConnections.Add(-1)
+			}()
+		}
+	})
+
+	//
+	// If the tui requests that a container be claimed then it will claimed and the
+	//
+	//	renewal process will renew those claims every 15 seconds
+	//
+	// If the tui requests that a containers claim be dropped it will stop renewing
+	//
+	//	the claim and within 30 seconds the container will be available to be
+	//	picked up by another agent
+	//
+	// Future state, polling should be unnecessary. All the kv buckets can be
+	//
+	//	subscribed to and notifications received as soon as a new container is
+	//	available or a claim is dropped.
+	//
+	// Future state, the claim doesn't need to expire naturally the agent should
+	//
+	//	notify the controller during shutdown or claim delete so another agent
+	//	can pick it up immediately
+
+	return wg.Wait()
+}
+
+func updateKnownContainers(ctx context.Context, logger *slog.Logger, kvState jetstream.KeyValue, foundContainers chan<- model.Container) error {
+	lister, err := kvState.ListKeys(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to list container keys: %s", err)
+	}
+
+	for k := range lister.Keys() {
+		logger.Info("found container key", "key", k)
+
+		val, err := kvState.Get(ctx, k)
+		if err != nil {
+			logger.Error("unable to get container kv value", "err", err)
+			return err
+		}
+
+		var m model.Container
+		err = json.NewDecoder(bytes.NewReader(val.Value())).Decode(&m)
+		if err != nil {
+			logger.Error("decoding jetstream container kv value", "err", err)
+			return err
+		}
+
+		// TODO: should this only emit container changes? What should happen when a container is removed
+		foundContainers <- m
+	}
+
+	return nil
+}
+
+func updateKnownClaims(ctx context.Context, logger *slog.Logger, kvClaims jetstream.KeyValue, foundClaims chan<- model.ContainerAssignment) error {
+	lister, err := kvClaims.ListKeys(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to list claim keys: %s", err)
+	}
+	for k := range lister.Keys() {
+		logger.Info("found claim key", "key", k)
+
+		val, err := kvClaims.Get(ctx, k)
+		if err != nil {
+			logger.Error("unable to get claim kv value", "err", err)
+			return err
+		}
+
+		var m model.ContainerAssignment
+		err = json.NewDecoder(bytes.NewReader(val.Value())).Decode(&m)
+		if err != nil {
+			logger.Error("decoding jetstream claim kv value", "err", err)
+			return err
+		}
+
+		// TODO: should this only emit container changes? What should happen when a container is removed
+		foundClaims <- m
+	}
+
+	return nil
+}
 
 func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL string) error {
 	wg, ctx := errgroup.WithContext(ctx)
