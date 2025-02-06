@@ -1,9 +1,11 @@
 package rpc
 
+import "github.com/shadowglass-xyz/prism/internal/model"
+
 type (
 	AgentStateArgs  struct{}
 	AgentStateReply struct {
-		Containers map[string]struct{}
+		Containers map[string]model.Container
 		Claims     map[string]struct{}
 	}
 	RemoveClaimArgs struct {
@@ -11,7 +13,7 @@ type (
 	}
 	RemoveClaimReply struct {
 		Success    bool
-		Containers map[string]struct{}
+		Containers map[string]model.Container
 		Claims     map[string]struct{}
 	}
 	AddClaimArgs struct {
@@ -19,7 +21,7 @@ type (
 	}
 	AddClaimReply struct {
 		Success    bool
-		Containers map[string]struct{}
+		Containers map[string]model.Container
 		Claims     map[string]struct{}
 	}
 )

@@ -21,7 +21,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	docker "github.com/docker/docker/client"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -42,7 +42,7 @@ const (
 
 type State struct {
 	mu                sync.RWMutex
-	containers        map[string]struct{}
+	containers        map[string]model.Container
 	claims            map[string]struct{}
 	activeConnections atomic.Int32
 }
@@ -81,6 +81,16 @@ func (st *State) AddClaim(args irpc.AddClaimArgs, reply *irpc.AddClaimReply) err
 	return nil
 }
 
+type agent struct {
+	agentID      string
+	logger       *slog.Logger
+	state        State
+	natsConn     *nats.Conn
+	dockerClient *docker.Client
+	kvState      jetstream.KeyValue
+	kvClaims     jetstream.KeyValue
+}
+
 func main() {
 	controlPlaneURL := os.Getenv("CONTROL_PLANE_URL")
 	agentID := os.Getenv("PRISM_AGENT_NODE_ID")
@@ -113,71 +123,68 @@ func main() {
 		os.Exit(exitCodeInterrupt)
 	}()
 
-	if err := run(ctx, logger, agentID, controlPlaneURL); err != nil {
+	conn, err := nats.Connect(controlPlaneURL)
+	if err != nil {
+		panic(fmt.Sprintf("connecting to control plane: %s", err))
+	}
+	defer conn.Close()
+
+	dockerCli, err := docker.NewClientWithOpts(docker.WithVersion("1.46"))
+	if err != nil {
+		panic(fmt.Sprintf("connecting to docker: %s", err))
+	}
+
+	jsConn, err := jetstream.New(conn)
+	if err != nil {
+		panic(fmt.Sprintf("unable to connect to jetstream: %s", err))
+	}
+
+	kvState, err := jsConn.KeyValue(ctx, "prism-state")
+	if err != nil {
+		panic(fmt.Sprintf("unable to connect to key/value store prism-state: %s", err))
+	}
+
+	kvClaims, err := jsConn.KeyValue(ctx, "prism-claims")
+	if err != nil {
+		panic(fmt.Sprintf("unable to connect to key/value store prism-claims: %s", err))
+	}
+
+	a := agent{
+		logger:  logger,
+		agentID: agentID,
+		state: State{
+			containers:        make(map[string]model.Container),
+			claims:            make(map[string]struct{}),
+			activeConnections: atomic.Int32{},
+		},
+		natsConn:     conn,
+		dockerClient: dockerCli,
+		kvState:      kvState,
+		kvClaims:     kvClaims,
+	}
+
+	if err := a.run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(exitCodeErr)
 	}
 }
 
-func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL string) error {
-	state := State{
-		containers:        make(map[string]struct{}),
-		claims:            make(map[string]struct{}),
-		activeConnections: atomic.Int32{},
-	}
-
-	conn, err := nats.Connect(controlPlaneURL)
-	if err != nil {
-		return fmt.Errorf("connecting to control plane: %w", err)
-	}
-	defer conn.Close()
-
-	cli, err := client.NewClientWithOpts(client.WithVersion("1.46"))
-	if err != nil {
-		return fmt.Errorf("connecting to docker: %w", err)
-	}
-
-	jsConn, err := jetstream.New(conn)
-	if err != nil {
-		return fmt.Errorf("unable to connect to jetstream: %s", err)
-	}
-
-	kvState, err := jsConn.KeyValue(ctx, "prism-state")
-	if err != nil {
-		return fmt.Errorf("unable to connect to key/value store prism-state: %s", err)
-	}
-
-	kvClaims, err := jsConn.KeyValue(ctx, "prism-claims")
-	if err != nil {
-		return fmt.Errorf("unable to connect to key/value store prism-claims: %s", err)
-	}
-
-	foundContainers := make(chan model.Container, 1)
-
+func (a *agent) run(ctx context.Context) error {
 	wg, ctx := errgroup.WithContext(ctx)
+
+	// TODO: if a claim is dropped then the container should become unclaimed and show up in this channel again
+	unclaimedContainers := make(chan model.Container, 1)
 	wg.Go(func() error {
-		defer close(foundContainers)
+		defer close(unclaimedContainers)
 		// It should pull all known containers from the controller every 15 seconds
 		for {
-			logger.Info("updating known containers")
-			updateKnownContainers(ctx, logger, kvState, foundContainers)
-
-			select {
-			case <-time.After(15 * time.Second):
-			case <-ctx.Done():
-				return ctx.Err()
+			a.logger.Info("updating unclaimed containers")
+			err := a.updateKnownContainers(ctx, unclaimedContainers)
+			if err != nil {
+				// Should the error be returned here? Maybe it should just be logged
+				// and the agent should continue...
+				return err
 			}
-		}
-	})
-
-	foundClaims := make(chan model.ContainerAssignment, 1)
-
-	wg.Go(func() error {
-		defer close(foundClaims)
-		// It should separately pull all known claims and refresh them every 15 seconds
-		for {
-			logger.Info("updating known claims")
-			updateKnownClaims(ctx, logger, kvClaims, foundClaims)
 
 			select {
 			case <-time.After(15 * time.Second):
@@ -188,14 +195,35 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 	})
 
 	wg.Go(func() error {
+		for unclaimedContainer := range unclaimedContainers {
+			err := a.maybeClaimContainer(ctx, unclaimedContainer)
+			if err != nil {
+				a.logger.Error("unable to claim container", slog.String("containerID", unclaimedContainer.ContainerID), slog.Any("err", err))
+			}
+			// TODO: this isn't safe
+			a.state.claims[unclaimedContainer.ContainerID] = struct{}{}
+		}
 		// If there are any unclaimed containers that the agent can process then they
 		//	should be claimed and their docker containers started
 		return nil
 	})
 
+	// It should separately renew owned claims every 15 seconds
 	wg.Go(func() error {
-		// It should separately renew owned claims every 15 seconds
-		return nil
+		for {
+			for claimedContainerID := range a.state.claims {
+				err := a.renewContainerClaim(ctx, claimedContainerID)
+				if err != nil {
+					a.logger.Error("unable to renew container claim", slog.String("containerID", claimedContainerID), slog.Any("err", err))
+				}
+			}
+
+			select {
+			case <-time.After(15 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	})
 
 	wg.Go(func() error {
@@ -206,7 +234,7 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 	wg.Go(func() error {
 		// If the tui connects then the claiming process will be put into manual mode
 		server := rpc.NewServer()
-		err := server.Register(&state)
+		err := server.Register(&a.state)
 		if err != nil {
 			return fmt.Errorf("rpc register: %w", err)
 		}
@@ -219,18 +247,18 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 		for {
 			conn, err := l.Accept()
 			if err != nil {
-				logger.Error("Accept error", slog.Any("err", err))
+				a.logger.Error("Accept error", slog.Any("err", err))
 				continue
 			}
 
-			logger.Info("New connection", slog.String("addr", conn.RemoteAddr().String()))
-			state.activeConnections.Add(1)
+			a.logger.Info("New connection", slog.String("addr", conn.RemoteAddr().String()))
+			a.state.activeConnections.Add(1)
 
 			// Handle the connection in a goroutine
 			go func() {
 				server.ServeConn(conn)
-				logger.Info("Connection closed", slog.String("addr", conn.RemoteAddr().String()))
-				state.activeConnections.Add(-1)
+				a.logger.Info("Connection closed", slog.String("addr", conn.RemoteAddr().String()))
+				a.state.activeConnections.Add(-1)
 			}()
 		}
 	})
@@ -258,60 +286,93 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 	return wg.Wait()
 }
 
-func updateKnownContainers(ctx context.Context, logger *slog.Logger, kvState jetstream.KeyValue, foundContainers chan<- model.Container) error {
-	lister, err := kvState.ListKeys(ctx)
+func (a *agent) updateKnownContainers(ctx context.Context, unclaimedContainers chan<- model.Container) error {
+	lister, err := a.kvState.ListKeys(ctx)
 	if err != nil {
 		return fmt.Errorf("unable to list container keys: %s", err)
 	}
 
 	for k := range lister.Keys() {
-		logger.Info("found container key", "key", k)
+		a.logger.Info("found container key", "key", k)
 
-		val, err := kvState.Get(ctx, k)
+		val, err := a.kvState.Get(ctx, k)
 		if err != nil {
-			logger.Error("unable to get container kv value", "err", err)
-			return err
+			return fmt.Errorf("unable to get container kv value: %s", err)
 		}
 
 		var m model.Container
 		err = json.NewDecoder(bytes.NewReader(val.Value())).Decode(&m)
 		if err != nil {
-			logger.Error("decoding jetstream container kv value", "err", err)
-			return err
+			return fmt.Errorf("decoding jetstream container kv value: %w", err)
 		}
 
-		// TODO: should this only emit container changes? What should happen when a container is removed
-		foundContainers <- m
+		// TODO: this isn't safe
+		a.state.containers[m.ContainerID] = m
+
+		containerClaimKey := fmt.Sprintf("container.%s", m.ContainerID)
+		_, err = a.kvClaims.Get(ctx, containerClaimKey)
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			a.logger.Info("container was not claimed", slog.String("containerID", m.ContainerID))
+			// Only push up unclaimed containers
+			unclaimedContainers <- m
+		} else {
+			a.logger.Info("container was already claimed", slog.String("containerID", m.ContainerID))
+		}
 	}
 
 	return nil
 }
 
-func updateKnownClaims(ctx context.Context, logger *slog.Logger, kvClaims jetstream.KeyValue, foundClaims chan<- model.ContainerAssignment) error {
-	lister, err := kvClaims.ListKeys(ctx)
+func (a *agent) maybeClaimContainer(ctx context.Context, unclaimedContainer model.Container) error {
+	containerClaimKey := fmt.Sprintf("container.%s", unclaimedContainer.ContainerID)
+
+	// Attempt to claim this container. If the create/claim fails then it was already claimed.
+	var assignment model.ContainerAssignment
+	assignment.AgentID = a.agentID
+	assignment.AssignedAt = time.Now()
+	assignment.ConfirmedAt = time.Now()
+	var b bytes.Buffer
+	err := json.NewEncoder(&b).Encode(assignment)
 	if err != nil {
-		return fmt.Errorf("unable to list claim keys: %s", err)
-	}
-	for k := range lister.Keys() {
-		logger.Info("found claim key", "key", k)
-
-		val, err := kvClaims.Get(ctx, k)
-		if err != nil {
-			logger.Error("unable to get claim kv value", "err", err)
-			return err
-		}
-
-		var m model.ContainerAssignment
-		err = json.NewDecoder(bytes.NewReader(val.Value())).Decode(&m)
-		if err != nil {
-			logger.Error("decoding jetstream claim kv value", "err", err)
-			return err
-		}
-
-		// TODO: should this only emit container changes? What should happen when a container is removed
-		foundClaims <- m
+		return fmt.Errorf("unable to encode assignment value: %w", err)
 	}
 
+	_, err = a.kvClaims.Create(ctx, containerClaimKey, b.Bytes())
+	if errors.Is(err, jetstream.ErrKeyExists) {
+		return fmt.Errorf("container [%s] already claimed. moving on", containerClaimKey)
+	}
+
+	a.logger.Info("container claimed", "key", containerClaimKey)
+	return nil
+}
+
+func (a *agent) renewContainerClaim(ctx context.Context, containerID string) error {
+	containerClaimKey := fmt.Sprintf("container.%s", containerID)
+	entry, err := a.kvClaims.Get(ctx, containerClaimKey)
+	if err != nil {
+		return fmt.Errorf("touching claim [%s] key failed: %w", containerClaimKey, err)
+	}
+
+	var assignment model.ContainerAssignment
+	err = json.NewDecoder(bytes.NewReader(entry.Value())).Decode(&assignment)
+	if err != nil {
+		return fmt.Errorf("decoding container assignment from claim: %w", err)
+	}
+
+	assignment.ConfirmedAt = time.Now()
+
+	var b bytes.Buffer
+	err = json.NewEncoder(&b).Encode(assignment)
+	if err != nil {
+		return fmt.Errorf("encoding updated confirmed assignment: %w", err)
+	}
+
+	_, err = a.kvClaims.Update(ctx, containerClaimKey, b.Bytes(), entry.Revision())
+	if err != nil {
+		return fmt.Errorf("updating claim on container key: %w", err)
+	}
+
+	a.logger.Info("touched claim", "key", containerClaimKey)
 	return nil
 }
 
@@ -319,7 +380,7 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 	wg, ctx := errgroup.WithContext(ctx)
 
 	state := State{
-		containers: make(map[string]struct{}),
+		containers: make(map[string]model.Container),
 		claims:     make(map[string]struct{}),
 	}
 
@@ -329,7 +390,7 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 	}
 	defer conn.Close()
 
-	cli, err := client.NewClientWithOpts(client.WithVersion("1.46"))
+	cli, err := docker.NewClientWithOpts(docker.WithVersion("1.46"))
 	if err != nil {
 		return fmt.Errorf("connecting to docker: %w", err)
 	}
@@ -418,7 +479,7 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 					}
 
 					containerClaimKey := fmt.Sprintf("container.%s", m.ContainerID)
-					state.containers[containerClaimKey] = struct{}{}
+					// state.containers[containerClaimKey] = struct{}{}
 
 					// Attempt to claim this container. If the create/claim fails then it was already claimed.
 					var assignment model.ContainerAssignment
@@ -530,7 +591,7 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 			logger.Info("received request to create container", "agentID", agentID, "container", cont.Name)
 			l := cont.Labels
 			if l == nil {
-				l = make(map[string]string)
+				l = make(map[string]string, 3)
 			}
 			l["controlled-by"] = "prism"
 			l["assigned-agent-id"] = agentID
@@ -612,7 +673,7 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 	return wg.Wait()
 }
 
-func gatherSystemUpdateMessage(ctx context.Context, cli *client.Client, agentID string) (model.Node, error) {
+func gatherSystemUpdateMessage(ctx context.Context, cli *docker.Client, agentID string) (model.Node, error) {
 	fm := memory.FreeMemory()
 	tm := memory.TotalMemory()
 
