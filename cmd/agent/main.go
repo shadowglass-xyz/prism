@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -105,7 +106,7 @@ func main() {
 	ctx := context.Background()
 	ctx, cancel := context.WithCancel(ctx)
 	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
 	defer func() {
 		signal.Stop(signalChan)
 		cancel()
@@ -118,8 +119,8 @@ func main() {
 			cancel()
 		case <-ctx.Done():
 		}
-		logger.Info("received second kill signal, hard exit")
 		<-signalChan
+		logger.Info("received second kill signal, hard exit")
 		os.Exit(exitCodeInterrupt)
 	}()
 
@@ -238,29 +239,52 @@ func (a *agent) run(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("rpc register: %w", err)
 		}
-		l, err := net.Listen("tcp", ":11245")
+		lc := new(net.ListenConfig)
+		l, err := lc.Listen(ctx, "tcp", ":11245")
 		if err != nil {
 			return fmt.Errorf("listen error: %w", err)
 		}
 
+		wgConn := new(sync.WaitGroup)
+		wgConn.Add(1)
+
 		// Accept and serve connections
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				a.logger.Error("Accept error", slog.Any("err", err))
-				continue
+		go func() {
+			defer wgConn.Done()
+
+			for {
+				a.logger.Info("waiting for a new rpc connection")
+				conn, err := l.Accept()
+				if err != nil {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						a.logger.Error("Accept error", slog.Any("err", err))
+					}
+				}
+
+				a.logger.Info("New connection", slog.String("addr", conn.RemoteAddr().String()))
+				wgConn.Add(1)
+				a.state.activeConnections.Add(1)
+
+				// Handle the connection in a goroutine
+				go func() {
+					server.ServeConn(conn)
+					a.logger.Info("Connection closed", slog.String("addr", conn.RemoteAddr().String()))
+					a.state.activeConnections.Add(-1)
+					wgConn.Done()
+				}()
 			}
+		}()
 
-			a.logger.Info("New connection", slog.String("addr", conn.RemoteAddr().String()))
-			a.state.activeConnections.Add(1)
+		<-ctx.Done()
+		// Close the listener so that the l.Accept() above will err
+		l.Close()
+		// Wait for any open connections to close
+		wgConn.Wait()
 
-			// Handle the connection in a goroutine
-			go func() {
-				server.ServeConn(conn)
-				a.logger.Info("Connection closed", slog.String("addr", conn.RemoteAddr().String()))
-				a.state.activeConnections.Add(-1)
-			}()
-		}
+		return nil
 	})
 
 	//
@@ -496,7 +520,6 @@ func run(ctx context.Context, logger *slog.Logger, agentID, controlPlaneURL stri
 					_, err = kvClaims.Create(ctx, containerClaimKey, b.Bytes())
 					if errors.Is(err, jetstream.ErrKeyExists) {
 						// container has already been claimed so move onto the next one
-						logger.Warn("container already claimed. moving on", "key", containerClaimKey)
 						continue
 					}
 
