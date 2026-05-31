@@ -1,0 +1,46 @@
+services:
+  envoy-server:
+    image: envoyproxy/envoy:v1.31-latest
+    networks:
+      - server
+    ports:
+      - 9901:9901
+      - 10000:10000
+    volumes:
+      - ./envoy.server.yaml:/etc/envoy/envoy.yaml
+
+  # iperf-server:
+  #   image: ubuntu
+  #   network_mode: service:envoy-server
+  #   command:
+  #   - sleep
+  #   - infinity
+
+  nginx-server:
+    image: nginx
+    network_mode: service:envoy-server
+
+  envoy-client:
+    image: envoyproxy/envoy:v1.31-latest
+    networks:
+      - client
+    ports:
+      - 9902:9902
+      - 10001:10001
+    volumes:
+      - ./envoy.client.yaml:/etc/envoy/envoy.yaml
+
+  # iperf-client:
+  #   image: ubuntu
+  #   network_mode: service:envoy-client
+  #   command:
+  #   - sleep
+  #   - infinity
+
+  nginx-client:
+    image: nginx
+    network_mode: service:envoy-client
+
+networks:
+  server:
+  client:
